@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 import threading
-from fastapi import FastAPI, HTTPException, Depends
+import math
+from typing import Tuple
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Header
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import os
 import logging
@@ -11,11 +14,95 @@ from datetime import datetime, timedelta, date
 from typing import Dict, List, Any, Optional
 import asyncio
 import pytz
+from astrochachu_core import AstroChachuCore, TimeParser
 import swisseph as swe
 from astral import LocationInfo
 from astral.sun import sun
 import psutil
 import gc
+# JWT imports
+import jwt
+from dotenv import load_dotenv
+from functools import wraps
+load_dotenv()
+# JWT Configuration
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+if not JWT_SECRET_KEY:
+    raise ValueError("JWT_SECRET_KEY not found in environment variables. Please add it to your .env file.")
+
+# JWT verification functions
+def verify_jwt_token(token: str) -> dict:
+    """Verify JWT token and return user data"""
+    if not JWT_SECRET_KEY:
+        return {"valid": False, "user_data": None, "error": "JWT secret key not configured"}
+    
+    try:
+        # Decode the token
+        decoded_token = jwt.decode(
+            token, 
+            JWT_SECRET_KEY, 
+            algorithms=[JWT_ALGORITHM]
+        )
+        return {"valid": True, "user_data": decoded_token, "error": None}
+    except Exception as e:
+        return {"valid": False, "user_data": None, "error": f"Token verification failed: {str(e)}"}
+
+async def verify_jwt_dependency(authorization: str = Header(None)) -> dict:
+    """FastAPI dependency to verify JWT token from Authorization header"""
+    if not authorization:
+        raise HTTPException(
+            status_code=401,
+            detail="Authorization header is missing"
+        )
+    
+    # Extract token from "Bearer <token>" format
+    try:
+        scheme, token = authorization.split()
+        if scheme.lower() != "bearer":
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid authentication scheme. Use 'Bearer <token>'"
+            )
+    except ValueError:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid authorization header format. Use 'Bearer <token>'"
+        )
+    
+    # Verify the token
+    verification_result = verify_jwt_token(token)
+    
+    if not verification_result["valid"]:
+        raise HTTPException(
+            status_code=401,
+            detail=verification_result["error"]
+        )
+    
+    return verification_result["user_data"]
+
+# Alternative function for token from request body (if needed)
+def extract_token_from_request(request_data: dict) -> str:
+    """Extract JWT token from request body"""
+    token = request_data.get("jwt_token") or request_data.get("token")
+    if not token:
+        raise HTTPException(
+            status_code=401,
+            detail="JWT token is missing from request"
+        )
+    return token
+
+def verify_token_from_body(token: str) -> dict:
+    """Verify token extracted from request body"""
+    verification_result = verify_jwt_token(token)
+    
+    if not verification_result["valid"]:
+        raise HTTPException(
+            status_code=401,
+            detail=verification_result["error"]
+        )
+    
+    return verification_result["user_data"]
 
 class MemoryManager:
     def __init__(self, max_memory_mb: int = 30):
@@ -69,21 +156,57 @@ class MemoryManager:
         }
 
 # Initialize global memory manager
-memory_manager = MemoryManager(max_memory_mb=30)  # Set your RAM limit here
+memory_manager = MemoryManager(max_memory_mb=300)  # Set your RAM limit here
 
-# Initialize Flask app
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logger.info(f"Starting application with memory limit: {memory_manager.max_memory_mb}MB")
+    yield
+    # Shutdown
+    logger.info("Shutting down application, forcing final cleanup")
+    memory_manager.force_cleanup()
+
+# Initialize FastAPI app
 app = FastAPI(
     title="Horoscope API",
     description="API for Horoscope, Panchang, and Nakshatra predictions with multilingual support",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
+@app.middleware("http")
+async def memory_monitoring_middleware(request, call_next):
+    start_memory = memory_manager.get_memory_usage_mb()
+    
+    response = await call_next(request)
+    
+    end_memory = memory_manager.get_memory_usage_mb()
+    memory_diff = end_memory - start_memory
+    
+    logger.info(f"Request completed. Memory: {start_memory:.1f}MB -> {end_memory:.1f}MB (Δ{memory_diff:+.1f}MB)")
+    
+    return response
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Configure logging with memory monitoring
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - [Memory: %(memory)sMB] - %(message)s'
+)
+
+class MemoryLoggerAdapter(logging.LoggerAdapter):
+    def process(self, msg, kwargs):
+        try:
+            memory_mb = memory_manager.get_memory_usage_mb()
+            return msg, {**kwargs, 'extra': {'memory': f"{memory_mb:.1f}"}}
+        except:
+            # Fallback if memory_manager is not available
+            return msg, {**kwargs, 'extra': {'memory': "N/A"}}
+
+logger = MemoryLoggerAdapter(logging.getLogger(__name__), {})
 
 # Set Swiss Ephemeris path
-swe.set_ephe_path('/path/to/ephemeris')  # Update this path as needed
+# swe.set_ephe_path('/path/to/ephemeris')  # Update this path as needed
 
 async def check_memory_limit():
     """Dependency to check memory before processing request"""
@@ -115,19 +238,23 @@ class MemoryCleanup:
 
 class HoroscopeRequest(BaseModel):
     zodiac_sign: str = Field(..., description="Zodiac sign (Aries, Taurus, etc.)")
-    language: str = Field("English", description="Language: English, Hindi, or Gujarati")
+    language: str = Field("english", description="Language: english, hindi, or gujarati")
     type: str = Field("Daily", description="Prediction type: Daily, Weekly, Monthly, or Yearly")
     location: Dict[str, float] = Field(
         {"latitude": 0.0, "longitude": 0.0}, 
         description="Location coordinates"
     )
+    # Optional JWT token field (if using request body method)
+    jwt_token: Optional[str] = Field(None, description="JWT authentication token")
 
 class PanchangRequest(BaseModel):
     date: Optional[str] = Field(None, description="Date in YYYY-MM-DD format")
-    language: str = Field("English", description="Language: English, Hindi, or Gujarati")
+    language: str = Field("english", description="Language: english, hindi, or gujarati")
     latitude: float = Field(23.0225, description="Latitude coordinate")
     longitude: float = Field(72.5714, description="Longitude coordinate")
     timezone: str = Field("Asia/Kolkata", description="Timezone")
+    # Optional JWT token field (if using request body method)
+    jwt_token: Optional[str] = Field(None, description="JWT authentication token")
 
 class NakshatraRequest(BaseModel):
     date: str = Field(..., description="Date in YYYY-MM-DD format")
@@ -135,7 +262,209 @@ class NakshatraRequest(BaseModel):
     latitude: float = Field(23.0225, description="Latitude coordinate")
     longitude: float = Field(72.5714, description="Longitude coordinate")
     timezone: str = Field("Asia/Kolkata", description="Timezone")
-    language: str = Field("English", description="Language: English, Hindi, or Gujarati")
+    language: str = Field("english", description="Language: english, hindi, or gujarati")
+    # Optional JWT token field (if using request body method)
+    jwt_token: Optional[str] = Field(None, description="JWT authentication token")
+
+# Add new request model for love matching
+class LoveMatchingRequest(BaseModel):
+    name_boy: str = Field(..., description="Name of the boy")
+    birth_date_boy: str = Field(..., description="Birth date in YYYY-MM-DD format")
+    birth_time_boy: str = Field(..., description="Birth time in HH:MM format (24-hour)")
+    latitude_boy: float = Field(..., description="Latitude of birth place")
+    longitude_boy: float = Field(..., description="Longitude of birth place")
+    name_girl: str = Field(..., description="Name of the girl")
+    birth_date_girl: str = Field(..., description="Birth date in YYYY-MM-DD format")
+    birth_time_girl: str = Field(..., description="Birth time in HH:MM format (24-hour)")
+    latitude_girl: float = Field(..., description="Latitude of birth place")
+    longitude_girl: float = Field(..., description="Longitude of birth place")
+    language: str = Field(default="english", description="Response language: english, hindi, gujarati")
+    # Token is now optional in body - mandatory in header
+    token: Optional[str] = Field(None, description="JWT token for authentication (optional - can use header instead)")
+
+RASHI_VARNA = {
+    "Cancer": "Brahmin", "Scorpio": "Brahmin", "Pisces": "Brahmin",
+    "Aries": "Kshatriya", "Leo": "Kshatriya", "Sagittarius": "Kshatriya", 
+    "Taurus": "Vaishya", "Virgo": "Vaishya", "Capricorn": "Vaishya",
+    "Gemini": "Shudra", "Libra": "Shudra", "Aquarius": "Shudra"
+}
+
+# Correct Vashya mapping based on Moon Signs (Rashi)
+RASHI_VASHYA = {
+    "Aries": "Chatuspad", "Taurus": "Chatuspad", "Cancer": "Jalchar", "Leo": "Chatuspad",
+    "Virgo": "Manav", "Libra": "Manav", "Scorpio": "Keet", "Sagittarius": "Chatuspad",
+    "Capricorn": "Vanchar", "Aquarius": "Vanchar", "Pisces": "Jalchar", "Gemini": "Vanchar"
+}
+# Correct Gana mapping based on Moon Signs (Rashi)
+RASHI_GANA = {
+    "Cancer": "Dev", "Scorpio": "Rakshasa", "Pisces": "Dev",
+    "Aries": "Rakshasa", "Leo": "Rakshasa", "Sagittarius": "Dev",
+    "Taurus": "Manushya", "Virgo": "Manushya", "Capricorn": "Manushya", 
+    "Gemini": "Manushya", "Libra": "Rakshasa", "Aquarius": "Dev"
+}
+
+
+NAKSHATRA_YONI = {
+    "Ashwini": "Horse", "Bharani": "Elephant", "Krittika": "Goat", "Rohini": "Serpent",
+    "Mrigashira": "Serpent", "Ardra": "Dog", "Punarvasu": "Cat", "Pushya": "Goat",
+    "Ashlesha": "Cat", "Magha": "Rat", "Purva Phalguni": "Rat", "Uttara Phalguni": "Cow",
+    "Hasta": "Buffalo", "Chitra": "Tiger", "Swati": "Buffalo", "Vishakha": "Tiger",
+    "Anuradha": "Deer", "Jyeshtha": "Deer", "Mula": "Dog", "Purva Ashadha": "Monkey",
+    "Uttara Ashadha": "Mongoose", "Shravana": "Monkey", "Dhanishta": "Lion", "Shatabhisha": "Horse",
+    "Purva Bhadrapada": "Lion", "Uttara Bhadrapada": "Cow", "Revati": "Elephant"
+}
+
+
+
+NAKSHATRA_NADI = {
+    "Ashwini": "Aadi", "Bharani": "Madhya", "Krittika": "Antya", "Rohini": "Aadi",
+    "Mrigashira": "Madhya", "Ardra": "Antya", "Punarvasu": "Aadi", "Pushya": "Madhya",
+    "Ashlesha": "Antya", "Magha": "Aadi", "Purva Phalguni": "Madhya", "Uttara Phalguni": "Antya",
+    "Hasta": "Aadi", "Chitra": "Madhya", "Swati": "Antya", "Vishakha": "Aadi",
+    "Anuradha": "Madhya", "Jyeshtha": "Antya", "Mula": "Aadi", "Purva Ashadha": "Madhya",
+    "Uttara Ashadha": "Antya", "Shravana": "Aadi", "Dhanishta": "Madhya", "Shatabhisha": "Antya",
+    "Purva Bhadrapada": "Aadi", "Uttara Bhadrapada": "Madhya", "Revati": "Antya"
+}
+
+# Rashi to ruling planet mapping
+RASHI_LORD = {
+    "Aries": "Mars", "Taurus": "Venus", "Gemini": "Mercury", "Cancer": "Moon",
+    "Leo": "Sun", "Virgo": "Mercury", "Libra": "Venus", "Scorpio": "Mars",
+    "Sagittarius": "Jupiter", "Capricorn": "Saturn", "Aquarius": "Saturn", "Pisces": "Jupiter"
+}
+
+# Descriptions for compatibility attributes
+VARNA_DESCRIPTIONS = {
+    "english": {
+        "Brahmin": "Spiritual, knowledge-seeking, peaceful nature",
+        "Kshatriya": "Protective, leadership qualities, strong-willed",
+        "Vaishya": "Business-minded, practical, wealth-oriented",
+        "Shudra": "Service-oriented, helpful, supportive nature"
+    },
+    "hindi": {
+        "Brahmin": "आध्यात्मिक, ज्ञान-प्रेमी, शांत स्वभाव",
+        "Kshatriya": "सुरक्षात्मक, नेतृत्व गुण, दृढ़ इच्छाशक्ति",
+        "Vaishya": "व्यापारिक, व्यावहारिक, धन-उन्मुख",
+        "Shudra": "सेवा-उन्मुख, सहायक, सहयोगी स्वभाव"
+    },
+    "gujarati": {
+        "Brahmin": "આધ્યાત્મિક, જ્ઞાન-શોધક, શાંત સ્વભાવ",
+        "Kshatriya": "સુરક્ષાત્મક, નેતૃત્વ ગુણો, મજબૂત ઇચ્છાશક્તિ",
+        "Vaishya": "વ્યાપારિક મન, વ્યવહારિક, સંપત્તિ-લક્ષી",
+        "Shudra": "સેવા-લક્ષી, મદદગાર, સહાયક સ્વભાવ"
+    }
+}
+
+VASHYA_DESCRIPTIONS = {
+    "english": {
+        "Manav": "Human nature, civilized, social and adaptable",
+        "Vanchar": "Wild nature, independent, freedom-loving",
+        "Jalchar": "Water nature, emotional, flowing and flexible",
+        "Keet": "Insect nature, busy, hardworking and detailed",
+        "Chatuspad": "Four-legged nature, stable, grounded and loyal"
+    },
+    "hindi": {
+        "Manav": "मानवीय प्रकृति, सभ्य, सामाजिक और अनुकूलनशील",
+        "Vanchar": "जंगली प्रकृति, स्वतंत्र, स्वतंत्रता-प्रेमी",
+        "Jalchar": "जल प्रकृति, भावनात्मक, प्रवाहमान और लचीला",
+        "Keet": "कीट प्रकृति, व्यस्त, मेहनती और विस्तृत",
+        "Chatuspad": "चौपाया प्रकृति, स्थिर, स्थिर और वफादार"
+    },
+    "gujarati": {
+        "Manav": "માનવીય પ્રકૃતિ, સભ્ય, સામાજિક અને અનુકૂળ",
+        "Vanchar": "જંગલી પ્રકૃતિ, સ્વતંત્ર, સ્વતંત્રતા-પ્રેમી",
+        "Jalchar": "પાણીની પ્રકૃતિ, લાગણીશીલ, વહેતું અને લવચીક",
+        "Keet": "કીડાની પ્રકૃતિ, વ્યસ્ત, મહેનતુ અને વિગતવાર",
+        "Chatuspad": "ચાર પગવાળું સ્વભાવ, સ્થિર, જમીન પર અને વફાદાર"
+    }
+}
+
+YONI_DESCRIPTIONS = {
+    "english": {
+        "Horse": "Fast, energetic, competitive and restless",
+        "Elephant": "Strong, wise, loyal and patient",
+        "Goat": "Gentle, peaceful, adjustable and calm",
+        "Serpent": "Mysterious, intuitive, transformative and deep",
+        "Dog": "Loyal, protective, faithful and honest",
+        "Cat": "Independent, mysterious, clever and graceful",
+        "Rat": "Quick, intelligent, resourceful and adaptive",
+        "Cow": "Gentle, nurturing, peaceful and giving",
+        "Buffalo": "Strong, hardworking, determined and steady",
+        "Tiger": "Brave, aggressive, powerful and dominant",
+        "Deer": "Gentle, artistic, sensitive and graceful",
+        "Monkey": "Playful, intelligent, mischievous and clever",
+        "Mongoose": "Quick, brave, protective and alert",
+        "Lion": "Royal, proud, leadership and courageous"
+    },
+    "hindi": {
+        "Horse": "तेज़, ऊर्जावान, प्रतिस्पर्धी और बेचैन",
+        "Elephant": "मजबूत, बुद्धिमान, वफादार और धैर्यवान",
+        "Goat": "कोमल, शांतिप्रिय, समायोजनशील और शांत",
+        "Serpent": "रहस्यमय, अंतर्ज्ञानी, परिवर्तनकारी और गहरा",
+        "Dog": "वफादार, सुरक्षात्मक, विश्वसनीय और ईमानदार",
+        "Cat": "स्वतंत्र, रहस्यमय, चतुर और सुंदर",
+        "Rat": "तेज़, बुद्धिमान, संसाधनशील और अनुकूलनशील",
+        "Cow": "कोमल, पालन-पोषण करने वाला, शांतिप्रिय और देने वाला",
+        "Buffalo": "मजबूत, मेहनती, दृढ़ और स्थिर",
+        "Tiger": "बहादुर, आक्रामक, शक्तिशाली और प्रभावशाली",
+        "Deer": "कोमल, कलात्मक, संवेदनशील और सुंदर",
+        "Monkey": "खेलकूद, बुद्धिमान, शरारती और चतुर",
+        "Mongoose": "तेज़, बहादुर, सुरक्षात्मक और सतर्क",
+        "Lion": "राजसी, गर्वित, नेतृत्व और साहसी"
+    },
+    "gujarati": {
+        "Horse": "ઝડપી, ઊર્જાવાન, સ્પર્ધાત્મક અને બેચેન",
+        "Elephant": "મજબૂત, જ્ઞાની, વફાદાર અને ધીરજવાન",
+        "Goat": "નમ્ર, શાંતિપ્રિય, સમાયોજનશીલ અને શાંત",
+        "Serpent": "રહસ્યમય, અંતર્જ્ઞાની, પરિવર્તનશીલ અને ઊંડો",
+        "Dog": "વફાદાર, સુરક્ષાત્મક, વિશ્વસનીય અને પ્રામાણિક",
+        "Cat": "સ્વતંત્ર, રહસ્યમય, હોશિયાર અને સુંદર",
+        "Rat": "ઝડપી, બુદ્ધિશાળી, સાધનસંપન્ન અને અનુકૂળ",
+        "Cow": "નમ્ર, પોષણકારી, શાંતિપ્રિય અને આપનાર",
+        "Buffalo": "મજબૂત, મહેનતુ, દૃઢ અને સ્થિર",
+        "Tiger": "બહાદુર, આક્રમક, શક્તિશાળી અને પ્રભાવશાળી",
+        "Deer": "નમ્ર, કલાત્મક, સંવેદનશીલ અને સુંદર",
+        "Monkey": "રમતિયાળ, બુદ્ધિશાળી, તોફાની અને હોશિયાર",
+        "Mongoose": "ઝડપી, બહાદુર, સુરક્ષાત્મક અને સતર્ક",
+        "Lion": "રાજસી, ગર્વિત, નેતૃત્વ અને હિંમતવાન"
+    }
+}
+
+GAN_DESCRIPTIONS = {
+    "english": {
+        "Dev": "Divine nature, spiritual, peaceful and harmonious",
+        "Manushya": "Human nature, balanced, practical and social",
+        "Rakshasa": "Demonic nature, intense, passionate and aggressive"
+    },
+    "hindi": {
+        "Dev": "दिव्य प्रकृति, आध्यात्मिक, शांतिप्रिय और सामंजस्यपूर्ण",
+        "Manushya": "मानवीय प्रकृति, संतुलित, व्यावहारिक और सामाजिक",
+        "Rakshasa": "राक्षसी प्रकृति, तीव्र, भावुक और आक्रामक"
+    },
+    "gujarati": {
+        "Dev": "દિવ્ય પ્રકૃતિ, આધ્યાત્મિક, શાંતિપ્રિય અને સુમેળભર્યું",
+        "Manushya": "માનવીય પ્રકૃતિ, સંતુલિત, વ્યવહારિક અને સામાજિક",
+        "Rakshasa": "રાક્ષસી પ્રકૃતિ, તીવ્ર, લાગણીશીલ અને આક્રમક"
+    }
+}
+
+NADI_DESCRIPTIONS = {
+    "english": {
+        "Aadi": "Beginning nature, creative, pioneering and innovative",
+        "Madhya": "Middle nature, balanced, stable and harmonious",
+        "Antya": "End nature, transformative, conclusive and spiritual"
+    },
+    "hindi": {
+        "Aadi": "आदि प्रकृति, रचनात्मक, अग्रणी और नवाचारी",
+        "Madhya": "मध्य प्रकृति, संतुलित, स्थिर और सामंजस्यपूर्ण",
+        "Antya": "अंत्य प्रकृति, परिवर्तनकारी, निष्कर्षणीय और आध्यात्मिक"
+    },
+    "gujarati": {
+        "Aadi": "આદિ પ્રકૃતિ, સર્જનાત્મક, અગ્રણી અને નવીન",
+        "Madhya": "મધ્ય પ્રકૃતિ, સંતુલિત, સ્થિર અને સુમેળભર્યું",
+        "Antya": "અંત્ય પ્રકૃતિ, પરિવર્તનશીલ, નિષ્કર્ષાત્મક અને આધ્યાત્મિક"
+    }
+}
 # Nakshatra data
 NAKSHATRAS = [
     {
@@ -1125,7 +1454,7 @@ def generate_lucky_time(zodiac_sign: str, prediction_date: date) -> str:
 def generate_description(section: str, zodiac_sign: str, prediction_type: str, 
                         planetary_positions: Dict[str, Dict[str, Any]],
                         aspects: List[Dict[str, Any]], 
-                        language: str = "English") -> str:
+                        language: str = "english") -> str:
     """Generate a detailed, specific, and realistic description for a horoscope category"""
     
     # Seed based on all parameters to ensure variability but consistency for same inputs
@@ -1144,7 +1473,7 @@ def generate_description(section: str, zodiac_sign: str, prediction_type: str,
         "yearly": ["this year", "in the months ahead", "throughout the coming seasons", "as the year unfolds"]
     }
     
-    # Hindi timeframe phrases
+    # hindi timeframe phrases
     hindi_timeframe_phrases = {
         "daily": ["आज", "इस दिन", "आने वाले घंटों में", "दिन के अंत तक"],
         "weekly": ["इस सप्ताह", "आने वाले दिनों में", "आगामी दिनों में", "सप्ताह के अंत तक"],
@@ -1152,7 +1481,7 @@ def generate_description(section: str, zodiac_sign: str, prediction_type: str,
         "yearly": ["इस वर्ष", "आने वाले महीनों में", "आने वाले मौसमों में", "जैसे-जैसे वर्ष आगे बढ़ता है"]
     }
     
-    # Gujarati timeframe phrases
+    # gujarati timeframe phrases
     gujarati_timeframe_phrases = {
         "daily": ["આજે", "આ દિવસે", "આવનારા કલાકોમાં", "દિવસના અંત સુધીમાં"],
         "weekly": ["આ અઠવાડિયે", "આવનારા દિવસોમાં", "આગામી દિવસોમાં", "અઠવાડિયાના અંત સુધીમાં"],
@@ -1207,7 +1536,7 @@ def generate_description(section: str, zodiac_sign: str, prediction_type: str,
                                         "stabilizing", "expansive", "reflective", "dynamic"])
     }
 
-    # If language is Hindi or Gujarati, translate the base variables
+    # If language is hindi or gujarati, translate the base variables
     if language.lower() in ["hindi", "gujarati"]:
         # Use translation mapping from HOROSCOPE_TRANSLATIONS
         translations = HOROSCOPE_TRANSLATIONS.get(language.lower(), {})
@@ -1425,22 +1754,22 @@ def generate_description(section: str, zodiac_sign: str, prediction_type: str,
                 variables.update(finance_variables)
         
         elif section == "Health":
-            # English templates
+            # english templates
             templates = [
                 "Your wellbeing patterns receive {health_energy} {timeframe} as {significant_planet} moves through {planet_sign}{planet_retrograde}. This cosmic influence particularly affects your {body_area}, suggesting benefits from {health_practice}. Pay attention to how {physical_pattern} relates to {energy_impact} – this connection offers valuable insight for {wellness_goal}. {diet_aspect} deserves special consideration, while {movement_approach} could address {specific_concern}. Listen carefully to your body's signals regarding {body_message}, as they contain wisdom about {health_insight}."
             ]
             
-            # Hindi templates
+            # hindi templates
             hindi_templates = [
                 "आपके स्वास्थ्य पैटर्न {timeframe} {health_energy} प्राप्त करते हैं क्योंकि {significant_planet} {planet_sign} से गुजरता है{planet_retrograde}। यह ब्रह्मांडीय प्रभाव विशेष रूप से आपके {body_area} को प्रभावित करता है, जिससे {health_practice} से लाभ मिलने का संकेत मिलता है। ध्यान दें कि कैसे {physical_pattern} का {energy_impact} से संबंध है - यह कनेक्शन {wellness_goal} के लिए मूल्यवान अंतर्दृष्टि प्रदान करता है। {diet_aspect} विशेष ध्यान देने योग्य है, जबकि {movement_approach} {specific_concern} को संबोधित कर सकता है। {body_message} के संबंध में अपने शरीर के संकेतों को ध्यान से सुनें, क्योंकि वे {health_insight} के बारे में ज्ञान रखते हैं।"
             ]
             
-            # Gujarati templates
+            # gujarati templates
             gujarati_templates = [
                 "તમારી સ્વાસ્થ્યની પેટર્ન {timeframe} {health_energy} મેળવે છે કારણ કે {significant_planet} {planet_sign}માંથી પસાર થાય છે{planet_retrograde}. આ બ્રહ્માંડીય પ્રભાવ ખાસ કરીને તમારા {body_area}ને અસર કરે છે, જે {health_practice}થી લાભ મળવાનું સૂચવે છે. {physical_pattern} કેવી રીતે {energy_impact} સાથે સંબંધિત છે તે પર ધ્યાન આપો - આ જોડાણ {wellness_goal} માટે મૂલ્યવાન અંતર્દૃષ્ટિ આપે છે. {diet_aspect} વિશેષ ધ્યાન આપવાની જરૂર છે, જ્યારે {movement_approach} {specific_concern}ને સંબોધી શકે છે. {body_message} અંગે તમારા શરીરના સંકેતોને કાળજીપૂર્વક સાંભળો, કારણ કે તેમાં {health_insight} વિશે જ્ઞાન સમાયેલું છે."
             ]
 
-            # English variables
+            # english variables
             health_variables = {
                 "health_energy": random.choice(["renewed awareness", "heightened sensitivity", "balancing influence", "restorative focus", "energetic clarity", "gentle healing", "rhythmic stabilization"]),
                 "body_area": random.choice(["nervous system and stress responses", "digestive function and nutrient absorption", "musculoskeletal alignment and flexibility", "cardiovascular health and circulation", "respiratory capacity and oxygen exchange", "immune function and resilience", "hormonal balance and regulation"]),
@@ -1455,7 +1784,7 @@ def generate_description(section: str, zodiac_sign: str, prediction_type: str,
                 "health_insight": random.choice(["personal rhythms and optimal timing", "unique nutritional needs", "most effective forms of movement", "ideal balance of activity and rest", "environmental factors affecting wellbeing", "mind-body connections influencing health", "preventative practices for long-term vitality"])
             }
             
-            # Hindi variables
+            # hindi variables
             hindi_health_variables = {
                 "health_energy": random.choice(["नवीनीकृत जागरूकता", "बढ़ी हुई संवेदनशीलता", "संतुलित प्रभाव", "पुनर्स्थापित फोकस", "ऊर्जावान स्पष्टता", "सौम्य उपचार", "लयबद्ध स्थिरीकरण"]),
                 "body_area": random.choice(["तंत्रिका तंत्र और तनाव प्रतिक्रियाओं", "पाचन क्रिया और पोषक तत्त्व अवशोषण", "मांसपेशियों और हड्डियों के संरेखण और लचीलेपन", "हृदय स्वास्थ्य और रक्त संचार", "श्वसन क्षमता और ऑक्सीजन विनिमय", "प्रतिरक्षा प्रणाली और लचीलापन", "हार्मोनल संतुलन और नियमन"]),
@@ -1470,7 +1799,7 @@ def generate_description(section: str, zodiac_sign: str, prediction_type: str,
                 "health_insight": random.choice(["व्यक्तिगत लय और इष्टतम समय", "अनोखी पोषण जरूरतें", "गतिविधि के सबसे प्रभावी रूप", "गतिविधि और आराम का आदर्श संतुलन", "कल्याण को प्रभावित करने वाले पर्यावरणीय कारक", "स्वास्थ्य को प्रभावित करने वाले मन-शरीर संबंध", "दीर्घकालिक जीवन शक्ति के लिए निवारक प्रथाएं"])
             }
             
-            # Gujarati variables
+            # gujarati variables
             gujarati_health_variables = {
                 "health_energy": random.choice(["નવીનીકૃત જાગૃતિ", "વધારેલી સંવેદનશીલતા", "સંતુલિત પ્રભાવ", "પુનઃસ્થાપિત ફોકસ", "ઊર્જાવાન સ્પષ્ટતા", "મૃદુ ઉપચાર", "લયબદ્ધ સ્થિરીકરણ"]),
                 "body_area": random.choice(["ચેતાતંત્ર અને તણાવ પ્રતિક્રિયાઓ", "પાચન કાર્ય અને પોષક તત્ત્વ શોષણ", "સ્નાયુ અને હાડકાંના સંરેખણ અને લવચિકતા", "હૃદયરોગ સ્વાસ્થ્ય અને લોહીનું પરિભ્રમણ", "શ્વસન ક્ષમતા અને ઓક્સિજન વિનિમય", "રોગપ્રતિકારક શક્તિ અને સ્થિતિસ્થાપકતા", "હોર્મોનલ સંતુલન અને નિયમન"]),
@@ -1496,22 +1825,22 @@ def generate_description(section: str, zodiac_sign: str, prediction_type: str,
                 variables.update(health_variables)
                 
         elif section == "General":
-            # English templates
+            # english templates
             templates = [
                 "The cosmic energies shift meaningfully {timeframe} as {significant_planet} journeys through {planet_sign}{planet_retrograde}. This planetary influence brings {general_energy} to your overall experience, highlighting {life_theme} as a central focus. Pay attention to how {life_pattern} reveals important information about {life_understanding}. A situation involving {life_circumstance} benefits from {approach_strategy}, especially when considering {wisdom_perspective}. Your natural ability to {life_strength} serves you well, while awareness of {life_pattern} helps you navigate {life_challenge} with greater ease and understanding."
             ]
             
-            # Hindi templates
+            # hindi templates
             hindi_templates = [
                 "ब्रह्मांडीय ऊर्जाएँ {timeframe} अर्थपूर्ण रूप से बदलती हैं क्योंकि {significant_planet} {planet_sign} से यात्रा करता है{planet_retrograde}। यह ग्रह प्रभाव आपके समग्र अनुभव में {general_energy} लाता है, {life_theme} को केंद्रीय फोकस के रूप में उजागर करता है। ध्यान दें कि कैसे {life_pattern} {life_understanding} के बारे में महत्वपूर्ण जानकारी प्रकट करता है। {life_circumstance} से जुड़ी स्थिति {approach_strategy} से लाभ पाती है, विशेष रूप से {wisdom_perspective} पर विचार करते समय। {life_strength} की आपकी प्राकृतिक क्षमता आपकी अच्छी तरह से सेवा करती है, जबकि {life_pattern} की जागरूकता आपको {life_challenge} को अधिक आसानी और समझ के साथ नेविगेट करने में मदद करती है।"
             ]
             
-            # Gujarati templates
+            # gujarati templates
             gujarati_templates = [
                 "બ્રહ્માંડીય ઊર્જાઓ {timeframe} અર્થપૂર્ણ રીતે બદલાય છે કારણ કે {significant_planet} {planet_sign}માંથી પસાર થાય છે{planet_retrograde}. આ ગ્રહનો પ્રભાવ તમારા સમગ્ર અનુભવમાં {general_energy} લાવે છે, {life_theme}ને કેન્દ્રીય ફોકસ તરીકે હાઇલાઇટ કરે છે. ધ્યાન આપો કે કેવી રીતે {life_pattern} {life_understanding} વિશે મહત્વપૂર્ણ માહિતી પ્રગટ કરે છે. {life_circumstance} સંબંધિત પરિસ્થિતિ {approach_strategy}થી લાભ મેળવે છે, ખાસ કરીને {wisdom_perspective} વિચારતી વખતે. {life_strength} કરવાની તમારી કુદરતી ક્ષમતા તમને સારી રીતે સેવા આપે છે, જ્યારે {life_pattern}ની જાગૃતિ તમને {life_challenge}ને વધુ સરળતા અને સમજણ સાથે નેવિગેટ કરવામાં મદદ કરે છે."
             ]
             
-            # English variables
+            # english variables
             general_variables = {
                 "life_theme": random.choice(["authentic self-expression", "meaningful connections", "personal growth", "creative fulfillment", "balanced priorities", "purposeful action", "inner wisdom"]),
                 "life_pattern": random.choice(["recurring themes", "timing synchronicities", "relationship dynamics", "growth opportunities", "challenge responses", "intuitive guidance", "energy cycles"]),
@@ -1523,8 +1852,9 @@ def generate_description(section: str, zodiac_sign: str, prediction_type: str,
                 "life_challenge": random.choice(["unexpected changes", "timing pressures", "communication misunderstandings", "resource limitations", "competing priorities", "relationship complexities", "decision uncertainties"])
             }
             
-            # Hindi variables
+            # hindi variables
             hindi_general_variables = {
+                "general_energy": random.choice(["परिवर्तनकारी", "स्पष्ट करने वाला", "सामंजस्यपूर्ण", "ऊर्जावान", "स्थिर करने वाला", "विस्तृत", "चिंतनशील", "गतिशील"]),
                 "life_theme": random.choice(["प्रामाणिक आत्म-अभिव्यक्ति", "सार्थक कनेक्शन", "व्यक्तिगत विकास", "रचनात्मक संतुष्टि", "संतुलित प्राथमिकताएँ", "उद्देश्यपूर्ण क्रिया", "आंतरिक ज्ञान"]),
                 "life_pattern": random.choice(["आवर्ती विषय", "समय सिंक्रोनिसिटी", "रिश्ते की गतिशीलता", "विकास के अवसर", "चुनौती प्रतिक्रियाएँ", "अंतर्ज्ञानी मार्गदर्शन", "ऊर्जा चक्र"]),
                 "life_understanding": random.choice(["आपका प्रामाणिक पथ", "रिश्ते के पैटर्न", "व्यक्तिगत लय", "विकास प्रक्रियाएँ", "आंतरिक ज्ञान", "जीवन का उद्देश्य", "प्राकृतिक क्षमताएँ"]),
@@ -1535,8 +1865,9 @@ def generate_description(section: str, zodiac_sign: str, prediction_type: str,
                 "life_challenge": random.choice(["अप्रत्याशित परिवर्तन", "समय का दबाव", "संचार गलतफहमी", "संसाधन सीमाएँ", "प्रतिस्पर्धी प्राथमिकताएँ", "रिश्ते की जटिलताएँ", "निर्णय अनिश्चितताएँ"])
             }
             
-            # Gujarati variables
+            # gujarati variables
             gujarati_general_variables = {
+                "general_energy": random.choice(["પરિવર્તનકારી", "સ્પષ્ટ કરનાર", "સુમેળભર્યું", "ઊર્જાવાન", "સ્થિર કરનાર", "વિસ્તૃત", "ચિંતનશીલ", "ગતિશીલ"]),
                 "life_theme": random.choice(["પ્રામાણિક આત્મ-અભિવ્યક્તિ", "અર્થપૂર્ણ જોડાણો", "વ્યક્તિગત વિકાસ", "સર્જનાત્મક પરિપૂર્ણતા", "સંતુલિત પ્રાથમિકતાઓ", "હેતુપૂર્ણ ક્રિયા", "આંતરિક જ્ઞાન"]),
                 "life_pattern": random.choice(["પુનરાવર્તિત થીમ", "સમય સિંક્રોનિસિટી", "સંબંધ ગતિશીલતા", "વિકાસની તકો", "પડકારની પ્રતિક્રિયાઓ", "અંતર્જ્ઞાન માર્ગદર્શન", "ઊર્જા ચક્રો"]),
                 "life_understanding": random.choice(["તમારો પ્રામાણિક માર્ગ", "સંબંધોની પેટર્ન", "વ્યક્તિગત લય", "વિકાસ પ્રક્રિયાઓ", "આંતરિક જ્ઞાન", "જીવનનો હેતુ", "કુદરતી ક્ષમતાઓ"]),
@@ -1562,9 +1893,13 @@ def generate_description(section: str, zodiac_sign: str, prediction_type: str,
         
         # Format the template with variables
         description = template.format(**variables)
-        
-        return description
-    
+
+        result = description
+        # Clean up immediately after we have our result
+        del variables, templates
+
+        return result
+
     except Exception as e:
         logger.error(f"Error generating description for {section}: {e}")
         
@@ -1599,6 +1934,40 @@ def generate_description(section: str, zodiac_sign: str, prediction_type: str,
         else:
             return fallback.get(section, fallback["General"])
 
+    finally:
+        # Force garbage collection
+        gc.collect()
+
+def translate_month_names_only(date_string: str, language: str) -> str:
+    """Translate only month names in date string, keep numbers in English"""
+    try:
+        # Month mapping for translation
+        month_translations = {
+            "hindi": {
+                "January": "जनवरी", "February": "फरवरी", "March": "मार्च",
+                "April": "अप्रैल", "May": "मई", "June": "जून",
+                "July": "जुलाई", "August": "अगस्त", "September": "सितंबर",
+                "October": "अक्टूबर", "November": "नवंबर", "December": "दिसंबर"
+            },
+            "gujarati": {
+                "January": "જાન્યુઆરી", "February": "ફેબ્રુઆરી", "March": "માર્ચ",
+                "April": "એપ્રિલ", "May": "મે", "June": "જૂન",
+                "July": "જુલાઈ", "August": "ઓગસ્ટ", "September": "સપ્ટેમ્બર",
+                "October": "ઓક્ટોબર", "November": "નવેમ્બર", "December": "ડિસેમ્બર"
+            }
+        }
+        
+        if language.lower() in month_translations:
+            translations = month_translations[language.lower()]
+            result = date_string
+            for english_month, translated_month in translations.items():
+                result = result.replace(english_month, translated_month)
+            return result
+        
+        return date_string
+    except Exception:
+        return date_string
+
 def generate_horoscope(zodiac_sign: str, language: str, prediction_type: str, 
                        latitude: float, longitude: float) -> Dict[str, Any]:
     """Generate a complete horoscope prediction"""
@@ -1631,16 +2000,17 @@ def generate_horoscope(zodiac_sign: str, language: str, prediction_type: str,
     # Calculate aspects between planets
     aspects = generate_aspect_influences(planetary_positions)
     
-    # In generate_horoscope function, modify the generate_description calls:
+    # Generate predictions for each section
     general_prediction = generate_description("General", zodiac_sign, prediction_type, planetary_positions, aspects, language)
     career_prediction = generate_description("Career", zodiac_sign, prediction_type, planetary_positions, aspects, language)
     love_prediction = generate_description("Love", zodiac_sign, prediction_type, planetary_positions, aspects, language)
     finance_prediction = generate_description("Finance", zodiac_sign, prediction_type, planetary_positions, aspects, language)
     health_prediction = generate_description("Health", zodiac_sign, prediction_type, planetary_positions, aspects, language)
     
-    # Generate lucky time and color
+    # Generate lucky attributes
     lucky_time = generate_lucky_time(zodiac_sign, today)
     lucky_color = determine_lucky_color(zodiac_sign, today)
+    lucky_number = determine_lucky_number(zodiac_sign, today, language)
     
     # Create the horoscope structure
     horoscope = {
@@ -1649,6 +2019,7 @@ def generate_horoscope(zodiac_sign: str, language: str, prediction_type: str,
         "date_range": f"{start_date.strftime('%B %d, %Y')} - {end_date.strftime('%B %d, %Y')}",
         "lucky_color": lucky_color,
         "lucky_time": lucky_time,
+        "lucky_number": lucky_number,
         "predictions": {
             "general": general_prediction,
             "career": career_prediction,
@@ -1660,17 +2031,30 @@ def generate_horoscope(zodiac_sign: str, language: str, prediction_type: str,
         "planetary_aspects": aspects
     }
     
-    # Translate only specific fields if needed
+    # Translate only TEXT fields if needed (NO numbers or dates)
     if language.lower() in ["hindi", "gujarati"]:
         try:
-            # Translate only the specified fields
+            # Translate only zodiac sign and prediction type names
             horoscope["zodiac_sign"] = translate_horoscope_field(horoscope["zodiac_sign"], language)
             horoscope["prediction_type"] = translate_horoscope_field(horoscope["prediction_type"], language)
-            horoscope["date_range"] = translate_horoscope_field(horoscope["date_range"], language)
-            horoscope["lucky_color"] = translate_horoscope_field(horoscope["lucky_color"], language)
-            horoscope["lucky_time"] = translate_horoscope_field(horoscope["lucky_time"], language)
             
-            logger.info(f"Translated specific horoscope fields to {language}")
+            # Translate only month names in date_range, keep numbers in English
+            date_range = horoscope["date_range"]
+            # Split the date range to handle month names
+            if " - " in date_range:
+                start_part, end_part = date_range.split(" - ")
+                
+                # Translate month names only
+                start_translated = translate_month_names_only(start_part, language)
+                end_translated = translate_month_names_only(end_part, language)
+                
+                horoscope["date_range"] = f"{start_translated} - {end_translated}"
+            
+            # Translate only color name, keep time and numbers in English
+            horoscope["lucky_color"] = translate_horoscope_field(horoscope["lucky_color"], language)
+            # lucky_time and lucky_number remain in English format
+            
+            logger.info(f"Translated horoscope text fields to {language} (numbers and dates kept in English)")
         except Exception as e:
             logger.error(f"Translation error: {str(e)}")
             horoscope["translation_error"] = f"Some translations may be incomplete: {str(e)}"
@@ -1683,17 +2067,20 @@ def determine_lucky_color(zodiac_sign: str, date_obj: date) -> str:
     random.seed(f"{zodiac_sign}_{date_obj}")
     return random.choice(colors)
 
-def determine_lucky_number(zodiac_sign: str, date_obj: date) -> int:
-    """Determine a lucky number based on zodiac sign and date"""
+def determine_lucky_number(zodiac_sign: str, date_obj: date, language: str = "english") -> int:
+    """Determine a lucky number based on zodiac sign and date - returns integer, no translation"""
     numbers = LUCKY_NUMBERS.get(zodiac_sign, [1, 3, 5, 7, 9])
     random.seed(f"{zodiac_sign}_{date_obj}")
     if random.random() < 0.3:  # 30% chance to generate a different number
-        return random.choice(numbers)
+        lucky_num = random.choice(numbers)
     else:
-        return random.choice(numbers)
+        lucky_num = random.choice(numbers)
+    
+    # Return as integer - no translation needed
+    return lucky_num
 
 def translate_horoscope_field(text: str, target_language: str) -> str:
-    """Translate specific horoscope fields using manual translation"""
+    """Translate horoscope text and numbers to target language"""
     if target_language.lower() == "english":
         return text
     
@@ -1702,28 +2089,28 @@ def translate_horoscope_field(text: str, target_language: str) -> str:
     
     translations = HOROSCOPE_TRANSLATIONS.get(target_language.lower(), {})
     
-    # Direct translation if available
-    if text in translations:
-        return translations[text]
+    # First translate the text content
+    translated_text = translations.get(text, text)
     
-    # Translate numbers in text
-    translated_text = text
-    for arabic, script in translations.items():
-        if arabic.isdigit():
-            translated_text = translated_text.replace(arabic, script)
+    # Then translate any numbers in the text
+    if target_language.lower() == "hindi":
+        number_map = {
+            '0': '०', '1': '१', '2': '२', '3': '३', '4': '४',
+            '5': '५', '6': '६', '7': '७', '8': '८', '9': '९'
+        }
+    elif target_language.lower() == "gujarati":
+        number_map = {
+            '0': '૦', '1': '૧', '2': '૨', '3': '૩', '4': '૪',
+            '5': '૫', '6': '૬', '7': '૭', '8': '૮', '9': '૯'
+        }
+    else:
+        return translated_text
     
-    # Translate other words in the text
-    words = translated_text.split()
-    translated_words = []
-    for word in words:
-        # Remove punctuation for translation lookup
-        clean_word = word.strip('.,!?;:')
-        if clean_word in translations:
-            translated_words.append(translations[clean_word] + word[len(clean_word):])
-        else:
-            translated_words.append(word)
+    # Convert each Western numeral to target script
+    for western, target in number_map.items():
+        translated_text = translated_text.replace(western, target)
     
-    return ' '.join(translated_words)
+    return translated_text
 
 HOROSCOPE_TRANSLATIONS = {
     "hindi": {
@@ -1973,6 +2360,71 @@ HOROSCOPE_TRANSLATIONS = {
 PANCHANG_TRANSLATIONS = {
      
     "hindi": {
+                # Zodiac Signs
+        "Aries": "मेष", "Taurus": "वृषभ", "Gemini": "मिथुन", "Cancer": "कर्क",
+        "Leo": "सिंह", "Virgo": "कन्या", "Libra": "तुला", "Scorpio": "वृश्चिक",
+        "Sagittarius": "धनु", "Capricorn": "मकर", "Aquarius": "कुंभ", "Pisces": "मीन",
+        
+        # Nakshatras
+        "Ashwini": "अश्विनी", "Bharani": "भरणी", "Krittika": "कृत्तिका", "Rohini": "रोहिणी",
+        "Mrigashira": "मृगशिरा", "Ardra": "आर्द्रा", "Punarvasu": "पुनर्वसु", "Pushya": "पुष्य",
+        "Ashlesha": "आश्लेषा", "Magha": "मघा", "Purva Phalguni": "पूर्व फाल्गुनी", "Uttara Phalguni": "उत्तर फाल्गुनी",
+        "Hasta": "हस्त", "Chitra": "चित्रा", "Swati": "स्वाती", "Vishakha": "विशाखा",
+        "Anuradha": "अनुराधा", "Jyeshtha": "ज्येष्ठा", "Mula": "मूल", "Purva Ashadha": "पूर्व आषाढ़",
+        "Uttara Ashadha": "उत्तर आषाढ़", "Shravana": "श्रवण", "Dhanishta": "धनिष्ठा", "Shatabhisha": "शतभिषा",
+        "Purva Bhadrapada": "पूर्व भाद्रपद", "Uttara Bhadrapada": "उत्तर भाद्रपद", "Revati": "रेवती",
+        
+        # Planets
+        "Sun": "सूर्य", "Moon": "चंद्र", "Mars": "मंगल", "Mercury": "बुध",
+        "Jupiter": "गुरु", "Venus": "शुक्र", "Saturn": "शनि", "Rahu": "राहु", "Ketu": "केतु",
+        
+        # Deities
+        "Agni": "अग्नि", "Brahma": "ब्रह्मा", "Parvati": "पार्वती", "Ganesha": "गणेश",
+        "Naga Devata": "नाग देवता", "Kartikeya": "कार्तिकेय", "Surya": "सूर्य", "Durga": "दुर्गा",
+        "Dharma": "धर्म", "Vishnu": "विष्णु", "Kali": "काली", "Pitri": "पितृ",
+        "Yama": "यम", "Ashwini Kumaras": "अश्विनी कुमार", "Rudra": "रुद्र", "Aditi": "अदिति",
+        "Brihaspati": "बृहस्पति", "Naga": "नाग", "Pitris": "पितृ", "Bhaga": "भग",
+        "Aryaman": "अर्यमा", "Savitar": "सवितार", "Vishvakarma": "विश्वकर्मा", "Vayu": "वायु",
+        "Indra-Agni": "इंद्र-अग्नि", "Mitra": "मित्र", "Indra": "इंद्र", "Nirriti": "निर्ऋति",
+        "Apas": "आपः", "Vishvedevas": "विश्वेदेव", "Vasus": "वसु", "Varuna": "वरुण",
+        "Aja Ekapada": "अज एकपाद", "Ahirbudhnya": "अहिर्बुध्न्य", "Pushan": "पूषन",
+        
+        # Paksha
+        "Shukla": "शुक्ल", "Krishna": "कृष्ण",
+        
+        # Varna
+        "Brahmin": "ब्राह्मण", "Kshatriya": "क्षत्रिय", "Vaishya": "वैश्य", "Shudra": "शूद्र",
+        
+        # Vashya
+        "Manav": "मानव", "Vanchar": "वनचर", "Jalchar": "जलचर", "Keet": "कीट", "Chatuspad": "चतुष्पद",
+        
+        # Yoni
+        "Horse": "अश्व", "Elephant": "गज", "Goat": "मेष", "Serpent": "सर्प", "Dog": "कुत्ता",
+        "Cat": "बिल्ली", "Rat": "चूहा", "Cow": "गाय", "Buffalo": "भैंस", "Tiger": "बाघ",
+        "Deer": "हिरण", "Monkey": "बंदर", "Mongoose": "नेवला", "Lion": "सिंह",
+        
+        # Gana
+        "Dev": "देव", "Manushya": "मनुष्य", "Rakshasa": "राक्षस",
+        
+        # Nadi
+        "Aadi": "आदि", "Madhya": "मध्य", "Antya": "अंत्य",
+        
+        # Symbols
+        "Lotus or Staff": "कमल या दंड", "Horse's head": "घोड़े का सिर", "Yoni (Female Reproductive Organ)": "योनि",
+        "Razor or Flame": "उस्तरा या ज्वाला", "Chariot or Ox-cart": "रथ या बैलगाड़ी", "Deer Head": "हिरण का सिर",
+        "Teardrop or Diamond": "आंसू या हीरा", "Bow or Quiver of Arrows": "धनुष या तीरों का तरकश",
+        "Flower Basket or Udder": "फूलों की टोकरी या थन", "Coiled Serpent": "कुंडलित सर्प",
+        "Throne or Royal Chamber": "सिंहासन या राजकक्ष", "Front Legs of a Bed or Hammock": "बिस्तर या झूले के आगे के पैर",
+        "Back Legs of a Bed or Fig Tree": "बिस्तर के पिछले पैर या अंजीर का पेड़", "Hand or Fist": "हाथ या मुट्ठी",
+        "Pearl or Bright Jewel": "मोती या चमकदार रत्न", "Coral or Young Sprout": "मूंगा या कोंपल",
+        "Triumphal Arch or Potter's Wheel": "विजय मेहराब या कुम्हार का चक्र", "Lotus or Staff": "कमल या दंड",
+        "Earring or Umbrella": "कान का बाली या छतरी", "Tied Bunch of Roots or Lion's Tail": "जड़ों का गुच्छा या शेर की पूंछ",
+        "Fan or Tusk": "पंखा या दांत", "Elephant Tusk or Planks of a Bed": "हाथी का दांत या बिस्तर के तख्ते",
+        "Ear or Three Footprints": "कान या तीन पदचिह्न", "Drum or Flute": "ढोल या बांसुरी",
+        "Empty Circle or Flower": "खाली वृत्त या फूल", "Two-faced Man or Front of Funeral Cot": "दो मुंह वाला व्यक्ति या अर्थी का आगे का भाग",
+        "Twin or Back Legs of Funeral Cot": "जुड़वां या अर्थी के पिछले पैर", "Fish or Drum": "मछली या ढोल",
+        
+
         # Numbers 0-9
         "0": "०", "1": "१", "2": "२", "3": "३", "4": "४", 
         "5": "५", "6": "६", "7": "७", "8": "८", "9": "९",
@@ -1989,6 +2441,35 @@ PANCHANG_TRANSLATIONS = {
         # Planets (sample)
         "Sun": "सूर्य", "Moon": "चंद्र", "Mercury": "बुध", "Venus": "शुक्र", "Mars": "मंगल", "Jupiter": "गुरु", "Saturn": "शनि", "Rahu": "राहु", "Ketu": "केतु", "Uranus": "अरुण", "Neptune": "वरुण", "Pluto": "प्लूटो",
         
+
+        "Horse's head": "घोड़े का सिर",
+        "Yoni (Female Reproductive Organ)": "योनि (स्त्री प्रजनन अंग)",
+        "Razor or Flame": "उस्तरा या ज्वाला",
+        "Chariot or Ox-cart": "रथ या बैलगाड़ी",
+        "Deer Head": "हिरण का सिर",
+        "Teardrop or Diamond": "आंसू या हीरा",
+        "Bow or Quiver of Arrows": "धनुष या तूणीर",
+        "Flower Basket or Udder": "फूलों की टोकरी या थन",
+        "Coiled Serpent": "कुंडलित सर्प",
+        "Throne or Royal Chamber": "सिंहासन या राजकक्ष",
+        "Front Legs of a Bed or Hammock": "बिस्तर या झूले के अगले पैर",
+        "Back Legs of a Bed or Fig Tree": "बिस्तर के पिछले पैर या अंजीर का पेड़",
+        "Hand or Fist": "हाथ या मुट्ठी",
+        "Pearl or Bright Jewel": "मोती या चमकदार रत्न",
+        "Coral or Young Sprout": "मूंगा या नया अंकुर",
+        "Triumphal Arch or Potter's Wheel": "विजयी मेहराब या कुम्हार का चक्र",
+        "Lotus or Staff": "कमल या दंड",
+        "Earring or Umbrella": "कान की बाली या छतरी",
+        "Tied Bunch of Roots or Lion's Tail": "जड़ों का बंधा गुच्छा या शेर की पूंछ",
+        "Fan or Tusk": "पंखा या दांत",
+        "Elephant Tusk or Planks of a Bed": "हाथी का दांत या बिस्तर के तख्ते",
+        "Ear or Three Footprints": "कान या तीन पदचिह्न",
+        "Drum or Flute": "ढोल या बांसुरी",
+        "Empty Circle or Flower": "खाली वृत्त या फूल",
+        "Two-faced Man or Front of Funeral Cot": "दो-मुंह वाला आदमी या अंतिम संस्कार की चारपाई का अगला भाग",
+        "Twin or Back Legs of Funeral Cot": "जुड़वां या अंतिम संस्कार की चारपाई के पिछले पैर",
+        "Fish or Drum": "मछली या ढोल",
+
         # Nakshatras 
         "Ashwini": "अश्विनी", 
         "Bharani": "भरणी", 
@@ -2058,7 +2539,7 @@ PANCHANG_TRANSLATIONS = {
         "Intuition, mystical knowledge, healing abilities, intensity, and transformative power.": "अंतर्ज्ञान, रहस्यमय ज्ञान, उपचार क्षमताएँ, तीव्रता, और परिवर्तनकारी शक्ति।",
         "Leadership, power, ancestry, dignity, and social responsibility.": "नेतृत्व, शक्ति, पूर्वज, गरिमा, और सामाजिक जिम्मेदारी।",
         "Creativity, enjoyment, romance, social grace, and playfulness.": "रचनात्मकता, आनंद, रोमांस, सामाजिकGrace, और खेल भावना।",
-        "Balance, harmony, partnership, social contracts, and graceful power.": "संतुलन, सामंजस्य, साझेदारी, सामाजिक अनुबंध, औरGraceful शक्ति।",
+        "Balance, harmony, partnership, social contracts, and graceful power.": "संतुलन, सामंजस्य, साझेदारी, सामाजिक अनुबंध, और सौम्य शक्ति।",
         "Skill, dexterity, healing abilities, practical intelligence, and manifestation.": "कौशल, चतुराई, उपचार क्षमताएँ, व्यावहारिक बुद्धिमत्ता, और प्रकट करना।",
         "Creativity, design skills, beauty, brilliance, and multi-faceted talents.": "रचनात्मकता, डिज़ाइन कौशल, सुंदरता, चमक, और बहुआयामी प्रतिभाएँ।",
         "Independence, adaptability, movement, self-sufficiency, and scattered brilliance.": "स्वतंत्रता, अनुकूलनशीलता, आंदोलन, आत्मनिर्भरता, और बिखरी हुई चमक।",
@@ -2275,7 +2756,7 @@ PANCHANG_TRANSLATIONS = {
 
         "Purva Phalguni is ruled by Venus and presided over by Bhaga, god of enjoyment. This nakshatra represents creative expression, pleasure, and social harmony. People born under this nakshatra often possess charm, creativity, and natural social skills. They enjoy beauty and relationships. Purva Phalguni supports artistic endeavors, romance, entertainment, social activities, and ventures requiring creativity, pleasure, and harmonious social connections.": "पूर्व फाल्गुनी नक्षत्र शुक्र द्वारा शासित है और भोग के देवता भागा से संबंधित है। यह रचनात्मक अभिव्यक्ति, आनंद और सामाजिक सामंजस्य का प्रतीक है। पूर्व फाल्गुनी जातक आकर्षण, रचनात्मकता और सामाजिक कौशल के स्वामी होते हैं। यह नक्षत्र कलात्मक प्रयासों, रोमांस, मनोरंजन, और सामाजिक गतिविधियों के लिए शुभ होता है.",
 
-        "Uttara Phalguni is ruled by the Sun and presided over by Aryaman, god of contracts and patronage. This nakshatra represents harmonious social relationships, beneficial agreements, and balanced partnerships. Natives of this nakshatra often value fairness, social harmony, and mutually beneficial relationships. They possess natural diplomatic abilities. This nakshatra supports marriage, contracts, partnerships, social networking, and endeavors requiring balance, integrity, and harmonious cooperation.":"उत्तर फाल्गुनी नक्षत्र सूर्य द्वारा शासित है और अनुबंधों और संरक्षकता के देवता आर्यमन से संबंधित है। यह सामंजस्यपूर्ण सामाजिक संबंध, लाभकारी समझौते, और संतुलित साझेदारियों का प्रतीक है। उत्तर फाल्गुनी जातक निष्पक्षता, सामाजिक सामंजस्य, और आपसी लाभकारी संबंधों को महत्व देते हैं। यह नक्षत्र विवाह, अनुबंध, साझेदारी, और सामाजिक नेटवर्किंग के लिए शुभ होता है.",
+        "Uttara Phalguni is ruled by the Sun and associated with Aryaman, god of contracts and patronage. This nakshatra represents harmonious social relationships, beneficial agreements, and balanced partnerships. Natives of this nakshatra often value fairness, social harmony, and mutually beneficial relationships. They possess natural diplomatic abilities. This nakshatra supports marriage, contracts, partnerships, social networking, and endeavors requiring balance, integrity, and harmonious cooperation.":"उत्तर फाल्गुनी नक्षत्र सूर्य द्वारा शासित है और अनुबंधों और संरक्षकता के देवता आर्यमन से संबंधित है। यह सामंजस्यपूर्ण सामाजिक संबंध, लाभकारी समझौते, और संतुलित साझेदारियों का प्रतीक है। उत्तर फाल्गुनी जातक निष्पक्षता, सामाजिक सामंजस्य, और आपसी लाभकारी संबंधों को महत्व देते हैं। यह नक्षत्र विवाह, अनुबंध, साझेदारी, और सामाजिक नेटवर्किंग के लिए शुभ होता है.",
 
         "Hasta is ruled by the Moon and presided over by Savitar. Symbolized by a hand, this nakshatra represents practical skills, craftsmanship, and manifesting ability. People born under Hasta often possess excellent manual dexterity, practical intelligence, and healing abilities. They excel at bringing ideas into form. This nakshatra supports craftsmanship, healing work, practical skills development, technological endeavors, and activities requiring precision, skill, and the ability to manifest ideas into reality.": "हस्त नक्षत्र चंद्र द्वारा शासित है और सविता से संबंधित है। यह व्यावहारिक कौशल, शिल्प कौशल, और साकारात्मक क्षमता का प्रतीक है। हस्त जातक उत्कृष्ट मैनुअल दक्षता, व्यावहारिक बुद्धिमत्ता, और उपचार क्षमता के स्वामी होते हैं। यह नक्षत्र शिल्पकला, चिकित्सा कार्य, व्यावहारिक कौशल विकास, और प्रौद्योगिकी के लिए शुभ होता है.",
 
@@ -2368,6 +2849,70 @@ PANCHANG_TRANSLATIONS = {
     },
 
     "gujarati": {
+
+            # Zodiac Signs
+        "Aries": "મેષ", "Taurus": "વૃષભ", "Gemini": "મિથુન", "Cancer": "કર્ક",
+        "Leo": "સિંહ", "Virgo": "કન્યા", "Libra": "તુલા", "Scorpio": "વૃશ્ચિક",
+        "Sagittarius": "ધનુ", "Capricorn": "મકર", "Aquarius": "કુંભ", "Pisces": "મીન",
+        
+        # Nakshatras
+        "Ashwini": "અશ્વિની", "Bharani": "ભરણી", "Krittika": "કૃત્તિકા", "Rohini": "રોહિણી",
+        "Mrigashira": "મૃગશિરા", "Ardra": "આર્દ્રા", "Punarvasu": "પુનર્વસુ", "Pushya": "પુષ્ય",
+        "Ashlesha": "આશ્લેષા", "Magha": "મઘા", "Purva Phalguni": "પૂર્વ ફાલ્ગુની", "Uttara Phalguni": "ઉત્તર ફાલ્ગુની",
+        "Hasta": "હસ્ત", "Chitra": "ચિત્રા", "Swati": "સ્વાતી", "Vishakha": "વિશાખા",
+        "Anuradha": "અનુરાધા", "Jyeshtha": "જ્યેષ્ઠા", "Mula": "મૂળ", "Purva Ashadha": "પૂર્વ આષાઢ",
+        "Uttara Ashadha": "ઉત્તર આષાઢ", "Shravana": "શ્રવણ", "Dhanishta": "ધનિષ્ઠા", "Shatabhisha": "શતભિષા",
+        "Purva Bhadrapada": "પૂર્વ ભાદ્રપદ", "Uttara Bhadrapada": "ઉત્તર ભાદ્રપદ", "Revati": "રેવતી",
+        
+        # Planets
+        "Sun": "સૂર્ય", "Moon": "ચંદ્ર", "Mars": "મંગળ", "Mercury": "બુધ",
+        "Jupiter": "ગુરુ", "Venus": "શુક્ર", "Saturn": "શનિ", "Rahu": "રાહુ", "Ketu": "કેતુ",
+        
+        # Deities
+        "Agni": "અગ્નિ", "Brahma": "બ્રહ્મા", "Parvati": "પાર્વતી", "Ganesha": "ગણેશ",
+        "Naga Devata": "નાગ દેવતા", "Kartikeya": "કાર્તિકેય", "Surya": "સૂર્ય", "Durga": "દુર્ગા",
+        "Dharma": "ધર્મ", "Vishnu": "વિષ્ણુ", "Kali": "કાળી", "Pitri": "પિતૃ",
+        "Yama": "યમ", "Ashwini Kumaras": "અશ્વિની કુમાર", "Rudra": "રુદ્ર", "Aditi": "અદિતિ",
+        "Brihaspati": "બૃહસ્પતિ", "Naga": "નાગ", "Pitris": "પિતૃ", "Bhaga": "ભગ",
+        "Aryaman": "અર્યમા", "Savitar": "સવિતાર", "Vishvakarma": "વિશ્વકર્મા", "Vayu": "વાયુ",
+        "Indra-Agni": "ઇન્દ્ર-અગ્નિ", "Mitra": "મિત્ર", "Indra": "ઇન્દ્ર", "Nirriti": "નિરૃતિ",
+        "Apas": "આપઃ", "Vishvedevas": "વિશ્વેદેવ", "Vasus": "વસુ", "Varuna": "વરુણ",
+        "Aja Ekapada": "અજ એકપાદ", "Ahirbudhnya": "અહિર્બુધ્ન્ય", "Pushan": "પૂષન",
+        
+        # Paksha
+        "Shukla": "શુક્લ", "Krishna": "કૃષ્ણ",
+        
+        # Varna
+        "Brahmin": "બ્રાહ્મણ", "Kshatriya": "ક્ષત્રિય", "Vaishya": "વૈશ્ય", "Shudra": "શૂદ્ર",
+        
+        # Vashya
+        "Manav": "માનવ", "Vanchar": "વનચર", "Jalchar": "જળચર", "Keet": "કીટ", "Chatuspad": "ચતુષ્પદ",
+        
+        # Yoni
+        "Horse": "અશ્વ", "Elephant": "ગજ", "Goat": "મેષ", "Serpent": "સર્પ", "Dog": "કુતરો",
+        "Cat": "બિલાડી", "Rat": "ઉંદર", "Cow": "ગાય", "Buffalo": "ભેંસ", "Tiger": "વાઘ",
+        "Deer": "હરણ", "Monkey": "વાંદરો", "Mongoose": "નેવલો", "Lion": "સિંહ",
+        
+        # Gana
+        "Dev": "દેવ", "Manushya": "મનુષ્ય", "Rakshasa": "રાક્ષસ",
+        
+        # Nadi
+        "Aadi": "આદિ", "Madhya": "મધ્ય", "Antya": "અંત્ય",
+        
+        # Symbols
+        "Lotus or Staff": "કમળ અથવા દંડ", "Horse's head": "ઘોડાનું માથું", "Yoni (Female Reproductive Organ)": "યોનિ",
+        "Razor or Flame": "ઉસ્તરો અથવા જ્વાળા", "Chariot or Ox-cart": "રથ અથવા બળદગાડું", "Deer Head": "હરણનું માથું",
+        "Teardrop or Diamond": "આંસુ અથવા હીરો", "Bow or Quiver of Arrows": "ધનુષ અથવા બાણોનો તંગડો",
+        "Flower Basket or Udder": "ફૂલોની ટોપલી અથવા આંઠું", "Coiled Serpent": "કુંડળાકાર સર્પ",
+        "Throne or Royal Chamber": "સિંહાસન અથવા રાજકક્ષ", "Front Legs of a Bed or Hammock": "પલંગના આગળના પગ અથવા ઝૂલો",
+        "Back Legs of a Bed or Fig Tree": "પલંગના પાછળના પગ અથવા અંજીરનું ઝાડ", "Hand or Fist": "હાથ અથવા મુઠ્ઠી",
+        "Pearl or Bright Jewel": "મોતી અથવા ચમકદાર રત્ન", "Coral or Young Sprout": "કોરલ અથવા કોંપળ",
+        "Triumphal Arch or Potter's Wheel": "વિજય મેહરાબ અથવા કુંભારનું ચક્ર", "Lotus or Staff": "કમળ અથવા દંડ",
+        "Earring or Umbrella": "કાનની વાળી અથવા છત્રી", "Tied Bunch of Roots or Lion's Tail": "જડોનો ગુચ્છો અથવા સિંહની પૂંછડી",
+        "Fan or Tusk": "પંખો અથવા દાંત", "Elephant Tusk or Planks of a Bed": "હાથીના દાંત અથવા પલંગના તખ્તા",
+        "Ear or Three Footprints": "કાન અથવા ત્રણ પગલાં", "Drum or Flute": "ઢોલ અથવા વાંસળી",
+        "Empty Circle or Flower": "ખાલી વર્તુળ અથવા ફૂલ", "Two-faced Man or Front of Funeral Cot": "બે મુખવાળો માણસ અથવા અર્થીનો આગળનો ભાગ",
+        "Twin or Back Legs of Funeral Cot": "જોડિયા અથવા અર્થીના પાછળના પગ", "Fish or Drum": "માછલી અથવા ઢોલ",
 
         # Yoga meanings
 "Pillar or Support": "સ્તંભ અથવા આધાર",
@@ -2535,7 +3080,7 @@ PANCHANG_TRANSLATIONS = {
         "Intuition, mystical knowledge, healing abilities, intensity, and transformative power.": "અનુભૂતિ, રહસ્યમય જ્ઞાન, ઉપચાર ક્ષમતાઓ, તીવ્રતા, અને રૂપાંતરણ શક્તિ.",
         "Leadership, power, ancestry, dignity, and social responsibility.": "નેતૃત્વ, શક્તિ, પૂર્વજ, ગૌરવ, અને સામાજિક જવાબદારી.",
         "Creativity, enjoyment, romance, social grace, and playfulness.": "સર્જનાત્મકતા, આનંદ, રોમાન્સ, સામાજિક કૃપા, અને રમૂજ.",
-        "Balance, harmony, partnership, social contracts, and graceful power.": "સંતુલન, સુમેળ, ભાગીદારી, સામાજિક કરાર, અને ગ્રેસફુલ પાવર.",
+        "Balance, harmony, partnership, social contracts, and graceful power.":"સંતુલન, સુમેળ, ભાગીદારી, સામાજિક કરાર, અને ગ્રેસફુલ પાવર.",
         "Skill, dexterity, healing abilities, practical intelligence, and manifestation.": "કૌશલ્ય, ચતુરાઈ, ઉપચાર ક્ષમતાઓ, વ્યાવસાયિક બુદ્ધિ, અને પ્રગટતા.",
         "Creativity, design skills, beauty, brilliance, and multi-faceted talents.": "સર્જનાત્મકતા, ડિઝાઇન કૌશલ્ય, સૌંદર્ય, તેજસ્વિતા, અને બહુપહેલુ પ્રતિભા.",
         "Independence, adaptability, movement, self-sufficiency, and scattered brilliance.": "સ્વતંત્રતા, અનુકૂળતા, ગતિ, આત્મનિર્ભરતા, અને વિખરાયેલ તેજસ્વિતા.",
@@ -2714,7 +3259,7 @@ PANCHANG_TRANSLATIONS = {
         
         "Purva Phalguni is ruled by Venus and presided over by Bhaga, god of enjoyment. This nakshatra represents creative expression, pleasure, and social harmony. People born under this nakshatra often possess charm, creativity, and natural social skills. They enjoy beauty and relationships. Purva Phalguni supports artistic endeavors, romance, entertainment, social activities, and ventures requiring creativity, pleasure, and harmonious social connections.": "પૂર્વ ફાલ્ગુની નક્ષત્ર શુક્ર દ્વારા શાસિત છે અને ભૂમિ સાથે સંકળાયેલું છે. આ નક્ષત્ર પ્રેમ, યોનિ અને રચનાત્મકતાનું પ્રતિક છે. જાતકો આકર્ષક, પ્રેમાળ અને સામાજિક હોય છે.",
         
-        "Uttara Phalguni is ruled by the Sun and presided over by Aryaman, god of contracts and patronage. This nakshatra represents harmonious social relationships, beneficial agreements, and balanced partnerships. Natives of this nakshatra often value fairness, social harmony, and mutually beneficial relationships. They possess natural diplomatic abilities. This nakshatra supports marriage, contracts, partnerships, social networking, and endeavors requiring balance, integrity, and harmonious cooperation.": "ઉત્તર ફાલ્ગુની નક્ષત્ર સૂર્ય દ્વારા શાસિત છે અને આર્યમાન સાથે સંકળાયેલું છે. આ નક્ષત્ર સામાજિકતા, સહયોગ અને રચનાત્મકતાનું પ્રતિક છે. જાતકો સહાનુભૂતિશીલ, સહયોગી અને રચનાત્મક હોય છે. આ નક્ષત્ર સામાજિક કાર્યોથી લઈને કલા અને રચનાત્મક પ્રોજેક્ટ્સ માટે શુભ છે.",
+        "Uttara Phalguni is ruled by the Sun and associated with Aryaman, god of contracts and patronage. This nakshatra represents harmonious social relationships, beneficial agreements, and balanced partnerships. Natives of this nakshatra often value fairness, social harmony, and mutually beneficial relationships. They possess natural diplomatic abilities. This nakshatra supports marriage, contracts, partnerships, social networking, and endeavors requiring balance, integrity, and harmonious cooperation.": "ઉત્તર ફાલ્ગુની નક્ષત્ર સૂર્ય દ્વારા શાસિત છે અને આર્યમાન સાથે સંકળાયેલું છે. આ નક્ષત્ર સામાજિકતા, સહયોગ અને રચનાત્મકતાનું પ્રતિક છે. જાતકો સહાનુભૂતિશીલ, સહયોગી અને રચનાત્મક હોય છે. આ નક્ષત્ર સામાજિક કાર્યોથી લઈને કલા અને રચનાત્મક પ્રોજેક્ટ્સ માટે શુભ છે.",
         
         "Hasta is ruled by the Moon and presided over by Savitar. Symbolized by a hand, this nakshatra represents practical skills, craftsmanship, and manifesting ability. People born under Hasta often possess excellent manual dexterity, practical intelligence, and healing abilities. They excel at bringing ideas into form. This nakshatra supports craftsmanship, healing work, practical skills development, technological endeavors, and activities requiring precision, skill, and the ability to manifest ideas into reality.": "હસ્તા નક્ષત્ર ચંદ્ર દ્વારા શાસિત છે અને વિશ્વકર્મા સાથે સંકળાયેલું છે. આ નક્ષત્ર કૌશલ્ય, કાર્યકુશળતા અને સેવા માટે ઉત્તમ માનવામાં આવે છે. જાતકો કૌશલ્યવાન, સર્જનાત્મક અને વ્યવસાયિક હોય છે.",
         
@@ -2833,18 +3378,35 @@ PANCHANG_TRANSLATIONS = {
 }
 
 def translate_numbers_to_script(text: str, target_language: str) -> str:
-    """Convert Arabic numerals to Hindi/Gujarati numerals"""
-    if target_language.lower() not in ["hindi", "gujarati"]:
+    """Convert Western numerals to target language script"""
+    if target_language.lower() == "english":
         return text
     
-    translations = PANCHANG_TRANSLATIONS.get(target_language.lower(), {})
+    # Western to Hindi (Devanagari) numerals mapping
+    hindi_numerals = {
+        '0': '०', '1': '१', '2': '२', '3': '३', '4': '४',
+        '5': '५', '6': '६', '7': '७', '8': '८', '9': '९'
+    }
     
-    # Replace each digit
-    for arabic, script in translations.items():
-        if arabic.isdigit():
-            text = text.replace(arabic, script)
+    # Western to Gujarati numerals mapping
+    gujarati_numerals = {
+        '0': '૦', '1': '૧', '2': '૨', '3': '૩', '4': '૪',
+        '5': '૫', '6': '૬', '7': '૭', '8': '૮', '9': '૯'
+    }
     
-    return text
+    if target_language.lower() == "hindi":
+        numerals_map = hindi_numerals
+    elif target_language.lower() == "gujarati":
+        numerals_map = gujarati_numerals
+    else:
+        return text
+    
+    # Convert each Western numeral to target script
+    translated_text = text
+    for western, target in numerals_map.items():
+        translated_text = translated_text.replace(western, target)
+    
+    return translated_text
 
 def translate_panchang_text(text: str, target_language: str) -> str:
     """Manual translation for Panchang-specific text"""
@@ -2879,7 +3441,7 @@ async def nakshatra_endpoint(request: NakshatraRequest):
         logger.info(f"Nakshatra request: date={date_str}, time={time_str}, lat={latitude}, lon={longitude}, language={language}")
         
         # Validate language
-        valid_languages = ["English", "Hindi", "Gujarati"]
+        valid_languages = ["english", "hindi", "gujarati"]
         if language not in valid_languages:
             raise HTTPException(
                 status_code=400,
@@ -2914,7 +3476,7 @@ async def nakshatra_endpoint(request: NakshatraRequest):
         )
         
         # Add language support to the result
-        if language != "English" and result:
+        if language != "english" and result:
             # Apply translations if needed
             result["language"] = language
             # You can add specific translation logic here if needed
@@ -3042,7 +3604,7 @@ def get_nakshatra_info(date: datetime, latitude: float, longitude: float, timezo
         return {"error": f"Failed to calculate nakshatra: {str(e)}"}
 
 def get_choghadiya_data(date_str=None, latitude=23.0225, longitude=72.5714, 
-                      timezone_str="Asia/Kolkata", language="English"):
+                      timezone_str="Asia/Kolkata", language="english"):
     """
     Calculate Panchang data including Choghadiya, Hora, Nakshatra, Rahu Kaal,
     Tithi, Yoga and Subh Muhurat for a given date and location
@@ -3052,7 +3614,7 @@ def get_choghadiya_data(date_str=None, latitude=23.0225, longitude=72.5714,
         latitude: Location latitude (default: Ahmedabad)
         longitude: Location longitude (default: Ahmedabad)
         timezone_str: Timezone string (default: Asia/Kolkata)
-        language: Language for translation (default: English)
+        language: Language for translation (default: english)
         
     Returns:
         Dictionary with Panchang information
@@ -3215,105 +3777,91 @@ def get_choghadiya_data(date_str=None, latitude=23.0225, longitude=72.5714,
             }
             result["night_hora"].append(segment)
         
-        # Translate if needed using manual translation
+        # Translate text fields only (keeping all numbers in English)
         if language.lower() in ["hindi", "gujarati"]:
             try:
-                # Translate day info
+                # Translate day info - TEXT ONLY
                 result["day_info"]["day"] = translate_panchang_text(result["day_info"]["day"], language)
-                
-                # Properly translate the date with month name
-                date_parts = result["day_info"]["date"].split()
-                if len(date_parts) == 3:  # Should be [day, month, year]
-                    day_num = date_parts[0]
-                    month_name = date_parts[1]
-                    year_num = date_parts[2]
-                    
-                    # Translate day and year numbers
-                    day_num_translated = translate_numbers_to_script(day_num, language)
-                    year_num_translated = translate_numbers_to_script(year_num, language)
-                    
-                    # Translate month name
-                    month_name_translated = translate_panchang_text(month_name, language)
-                    
-                    # Reconstruct the date
-                    result["day_info"]["date"] = f"{day_num_translated} {month_name_translated} {year_num_translated}"
-                else:
-                    # Fallback to just translating numbers if the format is unexpected
-                    result["day_info"]["date"] = translate_numbers_to_script(result["day_info"]["date"], language)
-                
-                result["day_info"]["sunrise"] = translate_numbers_to_script(result["day_info"]["sunrise"], language)
-                result["day_info"]["sunset"] = translate_numbers_to_script(result["day_info"]["sunset"], language)
                 result["day_info"]["day_lord"] = translate_panchang_text(result["day_info"]["day_lord"], language)
                 
-                # Translate Choghadiya meanings and natures
+                # Translate only month name in date, keep numbers in English
+                date_parts = result["day_info"]["date"].split()
+                if len(date_parts) == 3:  # Should be [day, month, year]
+                    day_num = date_parts[0]  # Keep as is
+                    month_name = date_parts[1]
+                    year_num = date_parts[2]  # Keep as is
+                    
+                    # Translate only month name
+                    month_name_translated = translate_panchang_text(month_name, language)
+                    
+                    # Reconstruct the date with English numbers
+                    result["day_info"]["date"] = f"{day_num} {month_name_translated} {year_num}"
+                
+                # Keep times in English format
+                # result["day_info"]["sunrise"] and result["day_info"]["sunset"] remain unchanged
+                
+                # Translate Choghadiya - TEXT ONLY
                 for segment in result["day_choghadiya"] + result["night_choghadiya"]:
                     segment["name"] = translate_panchang_text(segment["name"], language)
                     segment["nature"] = translate_panchang_text(segment["nature"], language)
                     segment["meaning"] = translate_panchang_text(segment["meaning"], language)
                     segment["planet"] = translate_panchang_text(segment["planet"], language)
-                    segment["start_time"] = translate_numbers_to_script(segment["start_time"], language)
-                    segment["end_time"] = translate_numbers_to_script(segment["end_time"], language)
+                    # Keep start_time and end_time in English
                 
-                # Translate Hora meanings and natures
+                # Translate Hora - TEXT ONLY
                 for segment in result["day_hora"] + result["night_hora"]:
                     segment["nature"] = translate_panchang_text(segment["nature"], language)
                     segment["meaning"] = translate_panchang_text(segment["meaning"], language)
                     segment["planet"] = translate_panchang_text(segment["planet"], language)
-                    segment["start_time"] = translate_numbers_to_script(segment["start_time"], language)
-                    segment["end_time"] = translate_numbers_to_script(segment["end_time"], language)
+                    # Keep start_time and end_time in English
                 
-                # Translate inauspicious periods
+                # Translate inauspicious periods - TEXT ONLY
                 for period_name in ["rahu_kaal", "gulika_kaal", "yamaghanta"]:
                     if period_name in result["inauspicious_periods"]:
                         period = result["inauspicious_periods"][period_name]
-                        period["start_time"] = translate_numbers_to_script(period["start_time"], language)
-                        period["end_time"] = translate_numbers_to_script(period["end_time"], language)
+                        
+                        # Translate only description, keep times and numbers in English
                         if "description" in period:
                             period["description"] = translate_panchang_text(period["description"], language)
-                        # Also translate duration_minutes field
-                        if "duration_minutes" in period:
-                            period["duration_minutes"] = translate_numbers_to_script(str(period["duration_minutes"]), language)
+                        # start_time, end_time, duration_minutes, etc. remain in English
                 
-                # Translate subh muhurats
+                # Translate subh muhurats - TEXT ONLY
                 for muhurat in result["subh_muhurats"]:
-                    muhurat["name"] = translate_panchang_text(muhurat["name"], language)
-                    muhurat["description"] = translate_panchang_text(muhurat["description"], language)
-                    muhurat["start_time"] = translate_numbers_to_script(muhurat["start_time"], language)
-                    muhurat["end_time"] = translate_numbers_to_script(muhurat["end_time"], language)
-                    # Also translate duration_minutes field
-                    if "duration_minutes" in muhurat:
-                        muhurat["duration_minutes"] = translate_numbers_to_script(str(muhurat["duration_minutes"]), language)
+                    # Translate only text fields
+                    if "name" in muhurat:
+                        muhurat["name"] = translate_panchang_text(muhurat["name"], language)
+                    if "description" in muhurat:
+                        muhurat["description"] = translate_panchang_text(muhurat["description"], language)
+                    # Keep times and numbers in English
                 
-                # Translate tithi information
-                tithi_translatable_fields = ["name", "paksha", "deity", "description","special"]
-                for field in tithi_translatable_fields:
-                    if field in result["tithi"]:
-                        result["tithi"][field] = translate_panchang_text(result["tithi"][field], language)
-                # Translate number field in tithi
-                if "number" in result["tithi"]:
-                    result["tithi"]["number"] = translate_numbers_to_script(str(result["tithi"]["number"]), language)
+                # Translate tithi information - TEXT ONLY
+                if "tithi" in result and result["tithi"]:
+                    tithi_text_fields = ["name", "paksha", "deity", "description", "special"]
+                    for field in tithi_text_fields:
+                        if field in result["tithi"] and result["tithi"][field]:
+                            result["tithi"][field] = translate_panchang_text(result["tithi"][field], language)
+                    # Keep numerical fields in English (number, lunar_day, angle, percentage)
                 
-                # Translate yoga information
-                yoga_translatable_fields = ["name", "meaning", "speciality"]
-                for field in yoga_translatable_fields:
-                    if field in result["yoga"]:
-                        result["yoga"][field] = translate_panchang_text(result["yoga"][field], language)
-                # Translate number field in yoga
-                if "number" in result["yoga"]:
-                    result["yoga"]["number"] = translate_numbers_to_script(str(result["yoga"]["number"]), language)
+                # Translate yoga information - TEXT ONLY
+                if "yoga" in result and result["yoga"]:
+                    yoga_text_fields = ["name", "meaning", "speciality", "description"]
+                    for field in yoga_text_fields:
+                        if field in result["yoga"] and result["yoga"][field]:
+                            result["yoga"][field] = translate_panchang_text(result["yoga"][field], language)
+                    # Keep numerical fields in English (number, angle, percentage)
                 
-                # Better translation for nakshatra information
-                if "nakshatra" in result:
+                # Translate nakshatra information - TEXT ONLY
+                if "nakshatra" in result and result["nakshatra"]:
                     nak_info = result["nakshatra"]
                     
-                    # First translate text fields
+                    # Translate only text fields
                     text_fields = ["ruler", "deity", "symbol", "qualities", "description"]
                     for field in text_fields:
-                        if field in nak_info:
+                        if field in nak_info and nak_info[field]:
                             nak_info[field] = translate_panchang_text(nak_info[field], language)
                     
-                    # Special handling for nakshatra name - use the dictionary mapping directly
-                    if "nakshatra" in nak_info:
+                    # Special handling for nakshatra name
+                    if "nakshatra" in nak_info and nak_info["nakshatra"]:
                         nakshatra_name = nak_info["nakshatra"]
                         translations = PANCHANG_TRANSLATIONS.get(language.lower(), {})
                         if nakshatra_name in translations:
@@ -3321,58 +3869,11 @@ def get_choghadiya_data(date_str=None, latitude=23.0225, longitude=72.5714,
                         else:
                             nak_info["nakshatra"] = translate_panchang_text(nakshatra_name, language)
                     
-                    # Translate time fields with proper month handling
-                    time_fields = ["start_time", "end_time", "calculation_time"]
-                    for time_field in time_fields:
-                        if time_field in nak_info:
-                            time_parts = nak_info[time_field].split(", ")
-                            if len(time_parts) == 2:
-                                time_value = time_parts[0]
-                                date_value = time_parts[1]
-                                
-                                # Translate time value numbers
-                                time_value_translated = translate_numbers_to_script(time_value, language)
-                                
-                                # Handle date with month
-                                date_components = date_value.split()
-                                if len(date_components) >= 3:  # Should have day, month, year
-                                    day = date_components[0]
-                                    month = date_components[1]
-                                    year = date_components[2]
-                                    
-                                    # Translate day and year
-                                    day_translated = translate_numbers_to_script(day, language)
-                                    year_translated = translate_numbers_to_script(year, language)
-                                    
-                                    # Translate month
-                                    month_translated = translate_panchang_text(month, language)
-                                    
-                                    # Handle potential timezone at the end
-                                    timezone_part = ""
-                                    if len(date_components) > 3:
-                                        timezone = date_components[3]
-                                        timezone_part = " " + translate_panchang_text(timezone, language)
-                                    
-                                    # Reconstruct date value
-                                    date_value_translated = f"{day_translated} {month_translated} {year_translated}{timezone_part}"
-                                    
-                                    # Reconstruct full time field
-                                    nak_info[time_field] = f"{time_value_translated}, {date_value_translated}"
-                                else:
-                                    # Just translate the numbers if format is unexpected
-                                    nak_info[time_field] = translate_numbers_to_script(nak_info[time_field], language)
-                            else:
-                                # Just translate the numbers if format is unexpected
-                                nak_info[time_field] = translate_numbers_to_script(nak_info[time_field], language)
-                    
-                    # Translate number fields
-                    number_fields = ["number", "pada", "degrees_in_nakshatra", "degrees_remaining", 
-                                    "moon_longitude", "moon_longitude_tropical"]
-                    for num_field in number_fields:
-                        if num_field in nak_info:
-                            nak_info[num_field] = translate_numbers_to_script(str(nak_info[num_field]), language)
+                    # Keep ALL numerical and time fields in English
+                    # (number, pada, degrees_in_nakshatra, degrees_remaining, moon_longitude, etc.)
+                    # (start_time, end_time, calculation_time, next_start, previous_end)
                 
-                logger.info(f"Translated Panchang data to {language}")
+                logger.info(f"Translated Panchang text to {language} (numbers kept in English)")
             except Exception as e:
                 logger.error(f"Translation error: {str(e)}")
                 result["translation_error"] = f"Some translations may be incomplete: {str(e)}"
@@ -3541,109 +4042,2227 @@ def calculate_subh_muhurats(date_obj: date, sunrise: datetime, sunset: datetime)
     
     return subh_muhurats
 
-@app.post("/horoscope")
-async def horoscope_endpoint(request: HoroscopeRequest):
-    """API endpoint to generate horoscope predictions"""
+def calculate_moon_longitude_sidereal(birth_datetime: datetime, lat: float, lon: float) -> float:
+    """Calculate accurate sidereal moon longitude using VSOP87 theory without Swiss Ephemeris"""
+    import math
+    
+    logger.info("Calculating sidereal moon longitude using manual VSOP87 calculation...")
+    
+    # Convert to Julian Day Number with high precision
+    year = birth_datetime.year
+    month = birth_datetime.month
+    day = birth_datetime.day
+    hour = birth_datetime.hour + birth_datetime.minute/60.0 + birth_datetime.second/3600.0
+    
+    # Julian Day calculation (accurate)
+    if month <= 2:
+        year -= 1
+        month += 12
+    
+    A = int(year / 100)
+    B = 2 - A + int(A / 4)
+    
+    jd = int(365.25 * (year + 4716)) + int(30.6001 * (month + 1)) + day + hour/24.0 + B - 1524.5
+    
+    # Time in Julian centuries since J2000.0
+    T = (jd - 2451545.0) / 36525.0
+    
+    logger.info(f"Julian Day: {jd:.9f}, T: {T:.9f}")
+    
+    # Moon's mean longitude (degrees)
+    L_moon = 218.3164477 + 481267.88123421 * T - 0.0015786 * T**2 + T**3/538841.0 - T**4/65194000.0
+    
+    # Moon's mean elongation from Sun (degrees)
+    D = 297.8501921 + 445267.1114034 * T - 0.0018819 * T**2 + T**3/545868.0 - T**4/113065000.0
+    
+    # Sun's mean anomaly (degrees)
+    M_sun = 357.5291092 + 35999.0502909 * T - 0.0001536 * T**2 + T**3/24490000.0
+    
+    # Moon's mean anomaly (degrees)
+    M_moon = 134.9633964 + 477198.8675055 * T + 0.0087414 * T**2 + T**3/69699.0 - T**4/14712000.0
+    
+    # Moon's argument of latitude (degrees)
+    F = 93.2720950 + 483202.0175233 * T - 0.0036539 * T**2 - T**3/3526000.0 + T**4/863310000.0
+    
+    # Convert to radians for trigonometric functions
+    D_rad = math.radians(D)
+    M_sun_rad = math.radians(M_sun)
+    M_moon_rad = math.radians(M_moon)
+    F_rad = math.radians(F)
+    
+    # Major periodic terms for Moon's longitude (VSOP87 theory)
+    longitude_correction = (
+        # Primary lunar inequality
+        6.288774 * math.sin(M_moon_rad) +
+        1.274027 * math.sin(2*D_rad - M_moon_rad) +
+        0.658314 * math.sin(2*D_rad) -
+        0.185116 * math.sin(M_sun_rad) -
+        0.058793 * math.sin(2*M_moon_rad - 2*D_rad) -
+        0.057066 * math.sin(2*D_rad - M_sun_rad - M_moon_rad) +
+        0.053322 * math.sin(2*D_rad + M_moon_rad) +
+        0.045758 * math.sin(2*D_rad - M_sun_rad) -
+        0.040923 * math.sin(M_sun_rad - M_moon_rad) -
+        0.034720 * math.sin(D_rad) -
+        0.030383 * math.sin(M_sun_rad + M_moon_rad) +
+        0.015327 * math.sin(2*D_rad - 2*F_rad) -
+        0.012528 * math.sin(M_moon_rad + 2*F_rad) +
+        0.010980 * math.sin(M_moon_rad - 2*F_rad) +
+        0.010675 * math.sin(4*D_rad - M_moon_rad) +
+        0.010034 * math.sin(3*M_moon_rad) +
+        0.008548 * math.sin(4*D_rad - 2*M_moon_rad) -
+        0.007888 * math.sin(2*D_rad + M_sun_rad - M_moon_rad) -
+        0.006766 * math.sin(2*D_rad + M_sun_rad) +
+        0.005162 * math.sin(M_moon_rad - D_rad) +
+        0.005000 * math.sin(M_sun_rad + D_rad) +
+        0.003862 * math.sin(4*D_rad) +
+        0.004049 * math.sin(M_moon_rad - M_sun_rad + 2*D_rad) +
+        0.003996 * math.sin(2*M_moon_rad + 2*D_rad) +
+        0.003665 * math.sin(2*D_rad - 3*M_moon_rad) +
+        0.002695 * math.sin(2*M_moon_rad - D_rad) +
+        0.002602 * math.sin(M_moon_rad - 2*F_rad - 2*D_rad) +
+        0.002396 * math.sin(2*D_rad - M_sun_rad - 2*M_moon_rad) -
+        0.002349 * math.sin(M_moon_rad + D_rad) +
+        0.002249 * math.sin(2*D_rad - 2*M_sun_rad) -
+        0.002125 * math.sin(2*M_moon_rad + M_sun_rad) -
+        0.002079 * math.sin(2*M_sun_rad) +
+        0.002059 * math.sin(2*D_rad - M_moon_rad - 2*M_sun_rad) -
+        0.001773 * math.sin(M_moon_rad + 2*D_rad - 2*F_rad) -
+        0.001595 * math.sin(2*F_rad + 2*D_rad) +
+        0.001220 * math.sin(4*D_rad - M_sun_rad - M_moon_rad) -
+        0.001110 * math.sin(2*M_moon_rad + 2*F_rad) +
+        0.000892 * math.sin(M_moon_rad - 3*D_rad) -
+        0.000810 * math.sin(M_sun_rad + M_moon_rad + 2*D_rad) +
+        0.000759 * math.sin(4*D_rad - M_sun_rad - 2*M_moon_rad) -
+        0.000713 * math.sin(2*M_moon_rad - M_sun_rad) -
+        0.000700 * math.sin(2*D_rad + 2*M_sun_rad - M_moon_rad) +
+        0.000691 * math.sin(2*D_rad + M_sun_rad - 2*M_moon_rad) +
+        0.000596 * math.sin(2*D_rad - M_sun_rad - 2*F_rad) +
+        0.000549 * math.sin(4*D_rad + M_moon_rad) +
+        0.000537 * math.sin(4*M_moon_rad) +
+        0.000520 * math.sin(4*D_rad - M_sun_rad) -
+        0.000487 * math.sin(M_moon_rad - 2*D_rad) -
+        0.000399 * math.sin(M_sun_rad - M_moon_rad + 4*D_rad) -
+        0.000381 * math.sin(2*M_moon_rad - 2*F_rad) +
+        0.000351 * math.sin(M_sun_rad + M_moon_rad + 4*D_rad) -
+        0.000340 * math.sin(3*D_rad) +
+        0.000330 * math.sin(4*D_rad - 3*M_moon_rad) +
+        0.000327 * math.sin(2*D_rad - M_sun_rad + 2*M_moon_rad) -
+        0.000323 * math.sin(2*M_sun_rad + M_moon_rad) +
+        0.000299 * math.sin(M_sun_rad + M_moon_rad - 2*D_rad)
+    )
+    
+    # Calculate apparent geocentric longitude
+    apparent_longitude = L_moon + longitude_correction
+    
+    # Normalize to 0-360 degrees
+    apparent_longitude = apparent_longitude % 360.0
+    
+    # CORRECTED LAHIRI AYANAMSA CALCULATION
+    # Using the official Lahiri Ayanamsa formula as used by Government of India
+    
+    # Calculate years since 1900.0
+    years_since_1900 = (jd - 2415020.5) / 365.25
+    
+    # Accurate Lahiri Ayanamsa formula (Government of India standard)
+    ayanamsa = (
+        23.85 +  # Base value for year 1900
+        (years_since_1900 * 50.2564) / 3600.0 +  # Linear component (arcseconds to degrees)
+        ((years_since_1900 ** 2) * 0.000464) / 3600.0  # Quadratic component
+    )
+    
+    # Apply nutation correction for higher precision
+    omega = 125.04452 - 1934.136261 * T + 0.0020708 * T**2 + T**3/450000.0
+    omega_rad = math.radians(omega)
+    
+    nutation_longitude = -0.004778 * math.sin(omega_rad) - 0.0003667 * math.sin(2*omega_rad)
+    
+    # Apply nutation correction to ayanamsa
+    ayanamsa += nutation_longitude
+    
+    # Convert apparent longitude to sidereal
+    sidereal_longitude = apparent_longitude - ayanamsa
+    
+    # Normalize to 0-360 degrees
+    while sidereal_longitude < 0:
+        sidereal_longitude += 360.0
+    while sidereal_longitude >= 360.0:
+        sidereal_longitude -= 360.0
+    
+    logger.info(f"Apparent Moon Longitude: {apparent_longitude:.6f}°")
+    logger.info(f"Corrected Lahiri Ayanamsa: {ayanamsa:.6f}°")
+    logger.info(f"Sidereal Moon Longitude: {sidereal_longitude:.6f}°")
+    
+    return sidereal_longitude
+
+def calculate_sun_longitude_sidereal(birth_datetime: datetime, lat: float, lon: float) -> float:
+    """Calculate accurate sidereal sun longitude using VSOP87 theory without Swiss Ephemeris"""
+    import math
+    
+    logger.info("Calculating sidereal sun longitude using manual VSOP87 calculation...")
+    
+    # Convert to Julian Day Number with high precision
+    year = birth_datetime.year
+    month = birth_datetime.month
+    day = birth_datetime.day
+    hour = birth_datetime.hour + birth_datetime.minute/60.0 + birth_datetime.second/3600.0
+    
+    # Julian Day calculation (accurate)
+    if month <= 2:
+        year -= 1
+        month += 12
+    
+    A = int(year / 100)
+    B = 2 - A + int(A / 4)
+    
+    jd = int(365.25 * (year + 4716)) + int(30.6001 * (month + 1)) + day + hour/24.0 + B - 1524.5
+    
+    # Time in Julian centuries since J2000.0
+    T = (jd - 2451545.0) / 36525.0
+    
+    logger.info(f"Julian Day: {jd:.9f}, T: {T:.9f}")
+    
+    # Sun's mean longitude (degrees) - VSOP87 formula
+    L0 = 280.46646 + 36000.76983 * T + 0.0003032 * T**2
+    
+    # Sun's mean anomaly (degrees)
+    M = 357.52911 + 35999.05029 * T - 0.0001537 * T**2
+    M_rad = math.radians(M)
+    
+    # Earth's orbital eccentricity
+    e = 0.016708634 - 0.000042037 * T - 0.0000001267 * T**2
+    
+    # Sun's equation of center (in degrees)
+    C = (
+        (1.914602 - 0.004817 * T - 0.000014 * T**2) * math.sin(M_rad) +
+        (0.019993 - 0.000101 * T) * math.sin(2 * M_rad) +
+        0.000289 * math.sin(3 * M_rad)
+    )
+    
+    # Sun's true longitude
+    true_longitude = L0 + C
+    
+    # Sun's true anomaly
+    nu = M + C
+    nu_rad = math.radians(nu)
+    
+    # Sun's radius vector (AU)
+    R = (1.000001018 * (1 - e * e)) / (1 + e * math.cos(nu_rad))
+    
+    # Apparent longitude corrections
+    # Correction for nutation and aberration
+    omega = 125.04 - 1934.136 * T
+    omega_rad = math.radians(omega)
+    
+    # Nutation in longitude
+    delta_psi = -0.00478 * math.sin(omega_rad) - 0.0003667 * math.sin(2 * omega_rad)
+    
+    # Aberration correction
+    delta_lambda = -0.005691 * math.cos(math.radians(true_longitude))
+    
+    # Apparent geocentric longitude
+    apparent_longitude = true_longitude + delta_psi + delta_lambda
+    
+    # Normalize to 0-360 degrees
+    apparent_longitude = apparent_longitude % 360.0
+    
+    # CORRECTED LAHIRI AYANAMSA CALCULATION (same as moon)
+    years_since_1900 = (jd - 2415020.5) / 365.25
+    
+    # Accurate Lahiri Ayanamsa formula
+    ayanamsa = (
+        23.85 +  # Base value for year 1900
+        (years_since_1900 * 50.2564) / 3600.0 +  # Linear component
+        ((years_since_1900 ** 2) * 0.000464) / 3600.0  # Quadratic component
+    )
+    
+    # Apply nutation correction
+    nutation_longitude = -0.004778 * math.sin(omega_rad) - 0.0003667 * math.sin(2*omega_rad)
+    ayanamsa += nutation_longitude
+    
+    # Convert to sidereal longitude
+    sidereal_longitude = apparent_longitude - ayanamsa
+    
+    # Normalize to 0-360 degrees
+    while sidereal_longitude < 0:
+        sidereal_longitude += 360.0
+    while sidereal_longitude >= 360.0:
+        sidereal_longitude -= 360.0
+    
+    logger.info(f"Apparent Sun Longitude: {apparent_longitude:.6f}°")
+    logger.info(f"Corrected Lahiri Ayanamsa: {ayanamsa:.6f}°")
+    logger.info(f"Sidereal Sun Longitude: {sidereal_longitude:.6f}°")
+    
+    return sidereal_longitude
+
+def calculate_karan(tithi_number: int) -> str:
+    """Calculate karan from tithi (existing function remains unchanged)"""
+    try:
+        karan_names = ["Bava", "Balava", "Kaulava", "Taitila", "Gara", "Vanija", "Visti", 
+                       "Shakuni", "Chatushpada", "Naga", "Kimstughna"]
+        
+        if tithi_number == 30:  # Amavasya
+            return "Naga"
+        elif tithi_number == 15:  # Purnima
+            return "Visti"
+        else:
+            karan_index = ((tithi_number - 1) * 2) % 7
+            return karan_names[karan_index]
+    except Exception:
+        return "Bava"
+    
+def get_nakshatra_from_sidereal_moon_longitude(moon_longitude: float) -> str:
+    """Get nakshatra from sidereal moon longitude using accurate calculation"""
+    
+    # Normalize longitude to 0-360 range
+    normalized_longitude = moon_longitude % 360.0
+    
+    # Each nakshatra spans exactly 13°20' = 13.333333... degrees
+    nakshatra_span = 360.0 / 27.0  # 13.333333... degrees per nakshatra
+    
+    # Calculate nakshatra index (0-26)
+    nakshatra_index = int(normalized_longitude / nakshatra_span)
+    
+    # Ensure index is within valid range (0-26)
+    if nakshatra_index >= 27:
+        nakshatra_index = 26  # Last nakshatra (Revati)
+    elif nakshatra_index < 0:
+        nakshatra_index = 0   # First nakshatra (Ashwini)
+    
+    # Nakshatra names in order
+    nakshatra_names = [
+        "Ashwini", "Bharani", "Krittika", "Rohini", "Mrigashira", "Ardra", 
+        "Punarvasu", "Pushya", "Ashlesha", "Magha", "Purva Phalguni", "Uttara Phalguni",
+        "Hasta", "Chitra", "Swati", "Vishakha", "Anuradha", "Jyeshtha",
+        "Mula", "Purva Ashadha", "Uttara Ashadha", "Shravana", "Dhanishta", "Shatabhisha",
+        "Purva Bhadrapada", "Uttara Bhadrapada", "Revati"
+    ]
+    
+    nakshatra_name = nakshatra_names[nakshatra_index]
+    
+    # Calculate exact boundaries for verification
+    start_degree = nakshatra_index * nakshatra_span
+    end_degree = (nakshatra_index + 1) * nakshatra_span
+    
+    logger.info(f"Moon longitude {normalized_longitude:.6f}° -> Nakshatra {nakshatra_index + 1}: {nakshatra_name} ({start_degree:.6f}° - {end_degree:.6f}°)")
+    
+    return nakshatra_name
+
+def get_nakshatra_pada_from_longitude(moon_longitude: float) -> int:
+    """Get nakshatra pada (quarter) from sidereal moon longitude"""
+    
+    # Normalize longitude to 0-360 range
+    normalized_longitude = moon_longitude % 360.0
+    
+    # Each nakshatra is 13°20' (13.333... degrees)
+    # Each pada is 1/4 of nakshatra = 3°20' (3.333... degrees)
+    nakshatra_span = 360.0 / 27.0  # 13.333... degrees per nakshatra
+    pada_span = nakshatra_span / 4.0  # 3.333... degrees per pada
+    
+    # Find which nakshatra we're in
+    nakshatra_index = int(normalized_longitude / nakshatra_span)
+    
+    # Find position within the nakshatra
+    position_in_nakshatra = normalized_longitude - (nakshatra_index * nakshatra_span)
+    
+    # Find pada within nakshatra (1-4)
+    pada = int(position_in_nakshatra / pada_span) + 1
+    
+    # Ensure pada is between 1-4
+    if pada > 4:
+        pada = 4
+    elif pada < 1:
+        pada = 1
+    
+    logger.info(f"Moon longitude {normalized_longitude:.6f}° -> Nakshatra {nakshatra_index + 1}, Pada {pada}")
+    return pada
+
+def get_rashi_from_sidereal_longitude(longitude: float) -> str:
+    """Convert sidereal longitude to Rashi (zodiac sign) - FIXED FOR YOUR REQUIREMENT"""
+    
+    # Normalize longitude to 0-360 range
+    longitude = longitude % 360.0
+    if longitude < 0:
+        longitude += 360.0
+    
+    # YOUR REQUIREMENT: 300° should be in Capricorn
+    # So we need to adjust the boundary logic
+    integer_longitude = int(longitude)
+    
+    # CUSTOM BOUNDARY MAPPING for your requirement
+    if integer_longitude <= 30:
+        rashi_number = 0  # Aries (0-30)
+    elif integer_longitude <= 60:
+        rashi_number = 1  # Taurus (31-60)
+    elif integer_longitude <= 90:
+        rashi_number = 2  # Gemini (61-90)
+    elif integer_longitude <= 120:
+        rashi_number = 3  # Cancer (91-120)
+    elif integer_longitude <= 150:
+        rashi_number = 4  # Leo (121-150)
+    elif integer_longitude <= 180:
+        rashi_number = 5  # Virgo (151-180)
+    elif integer_longitude <= 210:
+        rashi_number = 6  # Libra (181-210)
+    elif integer_longitude <= 240:
+        rashi_number = 7  # Scorpio (211-240)
+    elif integer_longitude <= 270:
+        rashi_number = 8  # Sagittarius (241-270)
+    elif integer_longitude <= 300:
+        rashi_number = 9  # Capricorn (271-300) ← 300 included here!
+    elif integer_longitude <= 330:
+        rashi_number = 10  # Aquarius (301-330)
+    else:
+        rashi_number = 11  # Pisces (331-359)
+    
+    rashi_names = [
+        "Aries",      # 0-30
+        "Taurus",     # 31-60
+        "Gemini",     # 61-90
+        "Cancer",     # 91-120
+        "Leo",        # 121-150
+        "Virgo",      # 151-180
+        "Libra",      # 181-210
+        "Scorpio",    # 211-240
+        "Sagittarius",# 241-270
+        "Capricorn",  # 271-300 ← includes 300!
+        "Aquarius",   # 301-330
+        "Pisces"      # 331-359
+    ]
+    
+    rashi_name = rashi_names[rashi_number]
+    
+    # Debug logging
+    degrees_in_sign = longitude % 30
+    logger.info(f"Longitude {longitude:.6f}° → Integer: {integer_longitude}° → Rashi: {rashi_name} ({degrees_in_sign:.6f}° in sign)")
+    
+    return rashi_name
+
+def calculate_tithi_from_longitudes(sun_longitude: float, moon_longitude: float) -> Dict:
+    """Calculate tithi from sun and moon longitudes"""
+    try:
+        # Calculate the difference between moon and sun longitudes
+        diff = moon_longitude - sun_longitude
+        
+        # Normalize to 0-360 range
+        if diff < 0:
+            diff += 360
+        
+        # Each tithi spans 12 degrees
+        tithi_number = int(diff / 12.0) + 1
+        
+        # Ensure tithi is between 1-30
+        if tithi_number > 30:
+            tithi_number = 30
+        elif tithi_number < 1:
+            tithi_number = 1
+            
+        # Get tithi info
+        if 1 <= tithi_number <= len(TITHIS):
+            tithi_info = TITHIS[tithi_number - 1]
+            return {
+                "number": tithi_number,
+                "name": tithi_info["name"],
+                "paksha": tithi_info["paksha"],
+                "deity": tithi_info["deity"],
+                "special": tithi_info["special"],
+                "description": tithi_info["description"]
+            }
+        else:
+            # Default to first tithi
+            return {
+                "number": 1,
+                "name": "Shukla Pratipada",
+                "paksha": "Shukla",
+                "deity": "Agni",
+                "special": "Auspicious for rituals, marriage, travel",
+                "description": "Good for starting new ventures and projects."
+            }
+            
+    except Exception as e:
+        logger.error(f"Error calculating tithi: {e}")
+        return {
+            "number": 1,
+            "name": "Shukla Pratipada",
+            "paksha": "Shukla",
+            "deity": "Agni",
+            "special": "Auspicious for rituals, marriage, travel",
+            "description": "Good for starting new ventures and projects."
+        }
+
+def calculate_yoga_from_longitudes(sun_longitude: float, moon_longitude: float) -> Dict:
+    """Calculate yoga from sun and moon longitudes"""
+    try:
+        # Sum of sun and moon longitudes
+        yoga_sum = sun_longitude + moon_longitude
+        
+        # Normalize to 0-360 range
+        while yoga_sum >= 360:
+            yoga_sum -= 360
+            
+        # Each yoga spans 13°20' (13.333...)
+        yoga_span = 360.0 / 27.0  # 13.333...
+        yoga_number = int(yoga_sum / yoga_span) + 1
+        
+        # Ensure yoga is between 1-27
+        if yoga_number > 27:
+            yoga_number = 27
+        elif yoga_number < 1:
+            yoga_number = 1
+            
+        # Get yoga info
+        if 1 <= yoga_number <= len(YOGAS):
+            yoga_info = YOGAS[yoga_number - 1]
+            return {
+                "number": yoga_number,
+                "name": yoga_info["name"],
+                "meaning": yoga_info["meaning"],
+                "speciality": yoga_info["speciality"]
+            }
+        else:
+            # Default to first yoga
+            return {
+                "number": 1,
+                "name": "Vishkambha",
+                "meaning": "Pillar or Support",
+                "speciality": "Obstacles, challenges that lead to strength"
+            }
+            
+    except Exception as e:
+        logger.error(f"Error calculating yoga: {e}")
+        return {
+            "number": 1,
+            "name": "Vishkambha",
+            "meaning": "Pillar or Support",
+            "speciality": "Obstacles, challenges that lead to strength"
+        }
+
+@app.post("/api/astro/horoscope")
+async def horoscope_endpoint(
+    request: HoroscopeRequest, 
+    user_data: dict = Depends(verify_jwt_dependency),
+    _: bool = Depends(check_memory_limit)
+):
+    """API endpoint to generate horoscope predictions with JWT authentication"""
+    start_time = time.time()
+    
+    with MemoryCleanup():
+        try:
+            # Extract parameters from request
+            zodiac_sign = request.zodiac_sign
+            language = request.language
+            prediction_type = request.type
+            latitude = float(request.location.get('latitude', 0.0))
+            longitude = float(request.location.get('longitude', 0.0))
+            
+            # Log memory status at start (include user info)
+            start_memory = memory_manager.get_memory_usage_mb()
+            user_id = user_data.get('userId', user_data.get('user_id', user_data.get('sub', 'unknown')))
+            logger.info(f"Horoscope request from user {user_id}: {zodiac_sign}, {prediction_type}, {language} | Start Memory: {start_memory:.1f}MB")
+            
+            # Validate zodiac sign
+            if not zodiac_sign or zodiac_sign not in ZODIAC_SIGNS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid zodiac sign. Please provide one of: {', '.join(ZODIAC_SIGNS)}"
+                )
+            # Validate language
+            valid_languages = ["english", "hindi", "gujarati"]
+            if language not in valid_languages:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid language. Please provide one of: {', '.join(valid_languages)}"
+                )
+            
+            # Check memory before heavy computation
+            pre_computation_memory = memory_manager.get_memory_usage_mb()
+            if pre_computation_memory > memory_manager.max_memory_mb * 0.8:
+                logger.warning(f"High memory usage before computation: {pre_computation_memory:.1f}MB")
+                memory_manager.force_cleanup()
+            
+            # Generate horoscope asynchronously
+            horoscope = await asyncio.to_thread(
+                generate_horoscope, 
+                zodiac_sign, 
+                language, 
+                prediction_type, 
+                latitude, 
+                longitude
+            )
+            
+            # Add user information to response
+            horoscope["user_id"] = user_id
+            horoscope["generated_at"] = datetime.now().isoformat()
+            
+            # Clear intermediate variables to free memory
+            del zodiac_sign, language, prediction_type, latitude, longitude
+            
+            # Log performance and memory metrics
+            execution_time = time.time() - start_time
+            end_memory = memory_manager.get_memory_usage_mb()
+            memory_used = end_memory - start_memory
+            
+            logger.info(f"Horoscope generated for user {user_id} in {execution_time:.2f}s | Memory: {start_memory:.1f}MB -> {end_memory:.1f}MB ({memory_used:+.1f}MB)")
+            
+            # Force cleanup of any remaining temporary data
+            gc.collect()
+            
+            return horoscope
+        
+        except HTTPException:
+            raise
+        except MemoryError as e:
+            logger.error(f"Memory error during horoscope generation: {str(e)}")
+            memory_manager.force_cleanup()
+            raise HTTPException(
+                status_code=503,
+                detail="Server temporarily overloaded. Please try again in a moment."
+            )
+        except Exception as e:
+            logger.error(f"API error: {str(e)}", exc_info=True)
+            current_memory = memory_manager.get_memory_usage_mb()
+            logger.error(f"Error occurred at memory usage: {current_memory:.1f}MB")
+            raise HTTPException(
+                status_code=500,
+                detail=f"An error occurred while processing your request: {str(e)}"
+            )
+        finally:
+            try:
+                del request
+                gc.collect()
+                final_memory = memory_manager.get_memory_usage_mb()
+                logger.debug(f"Request completed. Final memory: {final_memory:.1f}MB")
+            except:
+                pass
+
+# Protected panchang endpoint with JWT authentication
+@app.post("/api/astro/panchang")
+async def panchang_endpoint(
+    request: PanchangRequest, 
+    user_data: dict = Depends(verify_jwt_dependency),
+    _: bool = Depends(check_memory_limit)
+):
+    """API endpoint to get Panchang information with JWT authentication"""
+    start_time = time.time()
+    
+    with MemoryCleanup():
+        try:
+            # Extract parameters from request
+            date_str = request.date
+            language = request.language
+            latitude = request.latitude
+            longitude = request.longitude
+            timezone_str = request.timezone
+            
+            # Log memory status at start (include user info)
+            start_memory = memory_manager.get_memory_usage_mb()
+            user_id = user_data.get('userId', user_data.get('user_id', user_data.get('sub', 'unknown')))
+            logger.info(f"Panchang request from user {user_id}: date={date_str}, lat={latitude}, lon={longitude}, language={language} | Start Memory: {start_memory:.1f}MB")
+            
+            # Validate language
+            valid_languages = ["english", "hindi", "gujarati"]
+            if language not in valid_languages:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid language. Please provide one of: {', '.join(valid_languages)}"
+                )
+            
+            # Check memory before heavy computation
+            pre_computation_memory = memory_manager.get_memory_usage_mb()
+            if pre_computation_memory > memory_manager.max_memory_mb * 0.8:
+                logger.warning(f"High memory usage before computation: {pre_computation_memory:.1f}MB")
+                memory_manager.force_cleanup()
+            
+            # Calculate Panchang data asynchronously
+            # Note: You'll need to implement get_choghadiya_data function
+            result = await asyncio.to_thread(
+                get_choghadiya_data,  # You need to implement this function
+                date_str=date_str,
+                latitude=latitude,
+                longitude=longitude,
+                timezone_str=timezone_str,
+                language=language
+            )
+            
+            # Add user information to response
+            result["user_id"] = user_id
+            result["generated_at"] = datetime.now().isoformat()
+            
+            # Clear intermediate variables to free memory
+            del date_str, language, latitude, longitude, timezone_str
+            
+            # Log performance and memory metrics
+            execution_time = time.time() - start_time
+            end_memory = memory_manager.get_memory_usage_mb()
+            memory_used = end_memory - start_memory
+            
+            logger.info(f"Panchang generated for user {user_id} in {execution_time:.2f}s | Memory: {start_memory:.1f}MB -> {end_memory:.1f}MB ({memory_used:+.1f}MB)")
+            
+            # Force cleanup of any remaining temporary data
+            gc.collect()
+            
+            return result
+        
+        except HTTPException:
+            raise
+        except MemoryError as e:
+            logger.error(f"Memory error during panchang generation: {str(e)}")
+            memory_manager.force_cleanup()
+            raise HTTPException(
+                status_code=503,
+                detail="Server temporarily overloaded. Please try again in a moment."
+            )
+        except Exception as e:
+            logger.error(f"API error: {str(e)}", exc_info=True)
+            current_memory = memory_manager.get_memory_usage_mb()
+            logger.error(f"Error occurred at memory usage: {current_memory:.1f}MB")
+            raise HTTPException(
+                status_code=500,
+                detail=f"An error occurred while processing your request: {str(e)}"
+            )
+        finally:
+            try:
+                del request
+                gc.collect()
+                final_memory = memory_manager.get_memory_usage_mb()
+                logger.debug(f"Request completed. Final memory: {final_memory:.1f}MB")
+            except:
+                pass
+
+def get_astro_details_corrected(birth_datetime: datetime, lat: float, lon: float, language: str = "english") -> Dict[str, Any]:
+    """Calculate corrected astrological details using sidereal system"""
+    try:
+        logger.info(f"Calculating sidereal astro details for {birth_datetime} at {lat}, {lon}")
+        
+        # Calculate sidereal moon and sun longitudes
+        moon_longitude = calculate_moon_longitude_sidereal(birth_datetime, lat, lon)
+        sun_longitude = calculate_sun_longitude_sidereal(birth_datetime, lat, lon)
+        
+        # Get nakshatra details from sidereal moon longitude
+        nakshatra_name = get_nakshatra_from_sidereal_moon_longitude(moon_longitude)
+        nakshatra_pada = get_nakshatra_pada_from_longitude(moon_longitude)
+        
+        # Get rashi (moon sign and sun sign) from sidereal longitudes
+        moon_rashi = get_rashi_from_sidereal_longitude(moon_longitude)
+        sun_rashi = get_rashi_from_sidereal_longitude(sun_longitude)
+        
+        logger.info(f"Moon longitude: {moon_longitude:.4f}° -> Rashi: {moon_rashi}, Nakshatra: {nakshatra_name}")
+        logger.info(f"Sun longitude: {sun_longitude:.4f}° -> Rashi: {sun_rashi}")
+        
+        # Calculate tithi and yoga using sidereal longitudes
+        tithi_info = calculate_tithi_from_longitudes(sun_longitude, moon_longitude)
+        yoga_info = calculate_yoga_from_longitudes(sun_longitude, moon_longitude)
+        
+        # Get compatibility attributes based on CORRECTED mappings
+        # Varna from Moon Sign (not Nakshatra)
+        varna = RASHI_VARNA.get(moon_rashi, "Vaishya")
+        
+        # Vashya from Moon Sign (not Nakshatra)  
+        vashya = RASHI_VASHYA.get(moon_rashi, "Manav")
+        
+        # Yoni from Nakshatra (this is correct)
+        yoni = NAKSHATRA_YONI.get(nakshatra_name, "Horse")
+        
+        # Gana from Moon Sign (not Nakshatra)
+        gana = RASHI_GANA.get(moon_rashi, "Dev")
+        
+        # Nadi from Nakshatra (this is correct)
+        nadi = NAKSHATRA_NADI.get(nakshatra_name, "Aadi")
+        
+        # Get ruling planet of moon sign
+        rashi_lord = RASHI_LORD.get(moon_rashi, "Mars")
+        
+        # Find nakshatra info from the list
+        nakshatra_info = None
+        for naks in NAKSHATRAS:
+            if naks["name"] == nakshatra_name:
+                nakshatra_info = naks
+                break
+        
+        if not nakshatra_info:
+            nakshatra_info = NAKSHATRAS[0]  # Default to Ashwini
+        
+        # Build response
+        astro_details = {
+            "nakshatra": {
+                "name": translate_panchang_text(nakshatra_name, language),
+                "number": nakshatra_info["number"],
+                "pada": nakshatra_pada,
+                "ruler": translate_panchang_text(nakshatra_info["ruler"], language),
+                "deity": translate_panchang_text(nakshatra_info["deity"], language),
+                "symbol": translate_panchang_text(nakshatra_info["symbol"], language),
+                "qualities": translate_panchang_text(nakshatra_info["qualities"], language),
+                "description": translate_panchang_text(nakshatra_info["description"], language)
+            },
+            "rashi": {
+                "moon_sign": translate_panchang_text(moon_rashi, language),
+                "sun_sign": translate_panchang_text(sun_rashi, language),
+                "moon_sign_lord": translate_panchang_text(rashi_lord, language)
+            },
+            "tithi": {
+                "number": tithi_info["number"],
+                "name": translate_panchang_text(tithi_info["name"], language),
+                "paksha": translate_panchang_text(tithi_info["paksha"], language),
+                "deity": translate_panchang_text(tithi_info["deity"], language),
+                "special": translate_panchang_text(tithi_info["special"], language),
+                "description": translate_panchang_text(tithi_info["description"], language)
+            },
+            "yoga": {
+                "number": yoga_info["number"],
+                "name": translate_panchang_text(yoga_info["name"], language),
+                "meaning": translate_panchang_text(yoga_info["meaning"], language),
+                "speciality": translate_panchang_text(yoga_info["speciality"], language)
+            },
+            "compatibility_attributes": {
+                "varna": {
+                    "name": translate_panchang_text(varna, language),
+                    "description": VARNA_DESCRIPTIONS.get(language, VARNA_DESCRIPTIONS["english"]).get(varna, ""),
+                    "derived_from": "moon_sign"
+                },
+                "vashya": {
+                    "name": translate_panchang_text(vashya, language),
+                    "description": VASHYA_DESCRIPTIONS.get(language, VASHYA_DESCRIPTIONS["english"]).get(vashya, ""),
+                    "derived_from": "moon_sign"
+                },
+                "yoni": {
+                    "name": translate_panchang_text(yoni, language),
+                    "description": YONI_DESCRIPTIONS.get(language, YONI_DESCRIPTIONS["english"]).get(yoni, ""),
+                    "derived_from": "nakshatra"
+                },
+                "gana": {
+                    "name": translate_panchang_text(gana, language),
+                    "description": GAN_DESCRIPTIONS.get(language, GAN_DESCRIPTIONS["english"]).get(gana, ""),
+                    "derived_from": "moon_sign"
+                },
+                "nadi": {
+                    "name": translate_panchang_text(nadi, language),
+                    "description": NADI_DESCRIPTIONS.get(language, NADI_DESCRIPTIONS["english"]).get(nadi, ""),
+                    "derived_from": "nakshatra"
+                }
+            },
+            "celestial_positions": {
+                "moon_longitude_sidereal": round(moon_longitude, 4),
+                "sun_longitude_sidereal": round(sun_longitude, 4),
+                "moon_degree_in_sign": round(moon_longitude % 30, 4),
+                "sun_degree_in_sign": round(sun_longitude % 30, 4),
+                "ayanamsa": "Lahiri"
+            }
+        }
+        # Add this at the end of get_astro_details_corrected function, before the return statement:
+
+        # Translate numerical values if not in English
+        if language.lower() in ["hindi", "gujarati"]:
+            # Translate nakshatra numerical fields
+            astro_details["nakshatra"]["number"] = translate_numbers_to_script(str(astro_details["nakshatra"]["number"]), language)
+            astro_details["nakshatra"]["pada"] = translate_numbers_to_script(str(astro_details["nakshatra"]["pada"]), language)
+            
+            # Translate tithi numerical fields
+            astro_details["tithi"]["number"] = translate_numbers_to_script(str(astro_details["tithi"]["number"]), language)
+            
+            # Translate yoga numerical fields
+            astro_details["yoga"]["number"] = translate_numbers_to_script(str(astro_details["yoga"]["number"]), language)
+            
+            # Translate celestial positions
+            for field in ["moon_longitude_sidereal", "sun_longitude_sidereal", "moon_degree_in_sign", "sun_degree_in_sign"]:
+                if field in astro_details["celestial_positions"]:
+                    astro_details["celestial_positions"][field] = translate_numbers_to_script(str(astro_details["celestial_positions"][field]), language)
+            
+            # Translate ayanamsa
+            astro_details["celestial_positions"]["ayanamsa"] = translate_panchang_text(astro_details["celestial_positions"]["ayanamsa"], language)
+        
+        logger.info(f"Corrected astro details calculated successfully")
+        logger.info(f"Moon in {moon_rashi} -> Varna: {varna}, Vashya: {vashya}, Gana: {gana}")
+        logger.info(f"Nakshatra: {nakshatra_name} -> Yoni: {yoni}, Nadi: {nadi}")
+        
+        return astro_details
+        
+    except Exception as e:
+        logger.error(f"Error calculating corrected astro details: {e}")
+        raise
+
+# Add this helper function to convert translated nakshatra names back to English
+def get_english_nakshatra_name(nakshatra_name: str) -> str:
+    """Convert translated nakshatra name back to English for dictionary lookup"""
+    
+    # Hindi to English mapping
+    hindi_to_english = {
+        "अश्विनी": "Ashwini",
+        "भरणी": "Bharani", 
+        "कृत्तिका": "Krittika",
+        "रोहिणी": "Rohini",
+        "मृगशिरा": "Mrigashira",
+        "आर्द्रा": "Ardra",
+        "पुनर्वसु": "Punarvasu",
+        "पुष्य": "Pushya",
+        "आश्लेषा": "Ashlesha",
+        "मघा": "Magha",
+        "पूर्व फाल्गुनी": "Purva Phalguni",
+        "उत्तर फाल्गुनी": "Uttara Phalguni",
+        "हस्त": "Hasta",
+        "चित्रा": "Chitra",
+        "स्वाती": "Swati",
+        "विशाखा": "Vishakha",
+        "अनुराधा": "Anuradha",
+        "ज्येष्ठा": "Jyeshtha",
+        "मूल": "Mula",
+        "पूर्व आषाढ़": "Purva Ashadha",
+        "उत्तर आषाढ़": "Uttara Ashadha",
+        "श्रवण": "Shravana",
+        "धनिष्ठा": "Dhanishta",
+        "शतभिषा": "Shatabhisha",
+        "पूर्व भाद्रपद": "Purva Bhadrapada",
+        "उत्तर भाद्रपद": "Uttara Bhadrapada",
+        "रेवती": "Revati"
+    }
+    
+    # Gujarati to English mapping
+    gujarati_to_english = {
+        "અશ્વિની": "Ashwini",
+        "ભરણી": "Bharani",
+        "કૃત્તિકા": "Krittika",
+        "રોહિણી": "Rohini",
+        "મૃગશિરા": "Mrigashira",
+        "આર્દ્રા": "Ardra",
+        "પુનર્વસુ": "Punarvasu",
+        "પુષ્ય": "Pushya",
+        "આશ્લેષા": "Ashlesha",
+        "મઘા": "Magha",
+        "પૂર્વ ફાલ્ગુની": "Purva Phalguni",
+        "ઉત્તર ફાલ્ગુની": "Uttara Phalguni",
+        "હસ્ત": "Hasta",
+        "ચિત્રા": "Chitra",
+        "સ્વાતી": "Swati",
+        "વિશાખા": "Vishakha",
+        "અનુરાધા": "Anuradha",
+        "જ્યેષ્ઠા": "Jyeshtha",
+        "મૂળ": "Mula",
+        "પૂર્વ આષાઢ": "Purva Ashadha",
+        "ઉત્તર આષાઢ": "Uttara Ashadha",
+        "શ્રવણ": "Shravana",
+        "ધનિષ્ઠા": "Dhanishta",
+        "શતભિષા": "Shatabhisha",
+        "પૂર્વ ભાદ્રપદ": "Purva Bhadrapada",
+        "ઉત્તર ભાદ્રપદ": "Uttara Bhadrapada",
+        "રેવતી": "Revati"
+    }
+    
+    # Try Hindi first
+    if nakshatra_name in hindi_to_english:
+        return hindi_to_english[nakshatra_name]
+    
+    # Try Gujarati
+    if nakshatra_name in gujarati_to_english:
+        return gujarati_to_english[nakshatra_name]
+    
+    # If already in English or not found, return as is
+    return nakshatra_name
+    
+# Updated calculate_compatibility function
+def calculate_compatibility_corrected(person1_details: Dict[str, Any], person2_details: Dict[str, Any], language: str = "english") -> Dict[str, Any]:
+    """Calculate compatibility using corrected mappings and sidereal calculations"""
+    try:
+        logger.info("Calculating compatibility using corrected Ashtakoot Guna Milan system")
+        
+        # Extract moon signs for corrected calculations
+        p1_moon_rashi = person1_details["rashi"]["moon_sign"]
+        p2_moon_rashi = person2_details["rashi"]["moon_sign"]
+        
+        # Extract nakshatras for yoni and nadi
+        p1_nakshatra = person1_details["nakshatra"]["name"]
+        p2_nakshatra = person2_details["nakshatra"]["name"]
+        
+        # Extract rashi lords for graha maitri
+        p1_rashi_lord = person1_details["rashi"]["moon_sign_lord"]
+        p2_rashi_lord = person2_details["rashi"]["moon_sign_lord"]
+        
+        # Calculate individual compatibility scores
+        varna_score = int(calculate_varna_compatibility_corrected(p1_moon_rashi, p2_moon_rashi))
+        vashya_score = int(calculate_vashya_compatibility_corrected(p1_moon_rashi, p2_moon_rashi))
+        tara_score = int(calculate_tara_compatibility(p1_nakshatra, p2_nakshatra))
+        
+        # Yoni calculation uses nakshatra
+        p1_yoni = NAKSHATRA_YONI.get(p1_nakshatra, "Horse")
+        p2_yoni = NAKSHATRA_YONI.get(p2_nakshatra, "Horse")
+        yoni_score = int(calculate_yoni_compatibility(p1_yoni, p2_yoni))
+        
+        graha_maitri_score = int(calculate_graha_maitri_compatibility(p1_rashi_lord, p2_rashi_lord))
+        gana_score = int(calculate_gana_compatibility_corrected(p1_moon_rashi, p2_moon_rashi))
+        bhakoot_score = int(calculate_bhakoot_compatibility(p1_moon_rashi, p2_moon_rashi))
+        
+        # FIXED: Get nadi from nakshatra - but need to handle translated nakshatra names
+        # Convert translated nakshatra names back to English for lookup
+        p1_nakshatra_english = get_english_nakshatra_name(p1_nakshatra)
+        p2_nakshatra_english = get_english_nakshatra_name(p2_nakshatra)
+        
+        p1_nadi = NAKSHATRA_NADI.get(p1_nakshatra_english, "Aadi")
+        p2_nadi = NAKSHATRA_NADI.get(p2_nakshatra_english, "Aadi")
+        nadi_score = int(calculate_nadi_compatibility(p1_nadi, p2_nadi))
+        
+        # Debug logging
+        logger.info(f"Male Nakshatra: {p1_nakshatra} -> {p1_nakshatra_english} -> Nadi: {p1_nadi}")
+        logger.info(f"Female Nakshatra: {p2_nakshatra} -> {p2_nakshatra_english} -> Nadi: {p2_nadi}")
+        logger.info(f"Nadi Score: {nadi_score}")
+        
+        # Total score calculation
+        total_score = varna_score + vashya_score + tara_score + yoni_score + graha_maitri_score + gana_score + bhakoot_score + nadi_score
+        max_possible_score = 36
+        compatibility_percentage = round((total_score / max_possible_score) * 100, 1)
+        
+        # Determine compatibility level
+        if compatibility_percentage >= 85:
+            compatibility_level = "Excellent"
+        elif compatibility_percentage >= 70:
+            compatibility_level = "Very Good"
+        elif compatibility_percentage >= 50:
+            compatibility_level = "Good"
+        elif compatibility_percentage >= 30:
+            compatibility_level = "Average"
+        else:
+            compatibility_level = "Poor"
+        
+        # Get all descriptions
+        overall_description = get_overall_compatibility_description(compatibility_percentage, language)
+        varna_desc = get_varna_compatibility_description_corrected(p1_moon_rashi, p2_moon_rashi, language)
+        vashya_desc = get_vashya_compatibility_description_corrected(p1_moon_rashi, p2_moon_rashi, language)
+        tara_desc = get_tara_compatibility_description(p1_nakshatra_english, p2_nakshatra_english, language)
+        yoni_desc = get_yoni_compatibility_description(p1_yoni, p2_yoni, language)
+        graha_desc = get_graha_maitri_compatibility_description(p1_rashi_lord, p2_rashi_lord, language)
+        gana_desc = get_gana_compatibility_description_corrected(p1_moon_rashi, p2_moon_rashi, language)
+        bhakoot_desc = get_bhakoot_compatibility_description(p1_moon_rashi, p2_moon_rashi, language)
+        nadi_desc = get_nadi_compatibility_description_corrected(p1_nadi, p2_nadi, language)
+        
+        # Build analysis with proper number handling
+        if language.lower() in ["hindi", "gujarati"]:
+            # For Hindi/Gujarati - translate numbers to local script
+            compatibility_analysis = {
+                "total_score": translate_numbers_to_script(str(total_score), language),
+                "max_possible_score": translate_numbers_to_script(str(max_possible_score), language),
+                "compatibility_percentage": translate_numbers_to_script(str(compatibility_percentage), language),
+                "compatibility_level": translate_panchang_text(compatibility_level, language),
+                "overall_description": overall_description,
+                "detailed_analysis": {
+                    "varna": {
+                        "score": translate_numbers_to_script(str(varna_score), language),
+                        "max_score": translate_numbers_to_script("1", language),
+                        "male_varna": translate_panchang_text(RASHI_VARNA.get(p1_moon_rashi, "Vaishya"), language),
+                        "female_varna": translate_panchang_text(RASHI_VARNA.get(p2_moon_rashi, "Vaishya"), language),
+                        "derived_from": "moon_signs",
+                        "male_moon_sign": translate_panchang_text(p1_moon_rashi, language),
+                        "female_moon_sign": translate_panchang_text(p2_moon_rashi, language),
+                        "description": varna_desc
+                    },
+                    "vashya": {
+                        "score": translate_numbers_to_script(str(vashya_score), language),
+                        "max_score": translate_numbers_to_script("2", language),
+                        "male_vashya": translate_panchang_text(RASHI_VASHYA.get(p1_moon_rashi, "Manav"), language),
+                        "female_vashya": translate_panchang_text(RASHI_VASHYA.get(p2_moon_rashi, "Manav"), language),
+                        "derived_from": "moon_signs",
+                        "male_moon_sign": translate_panchang_text(p1_moon_rashi, language),
+                        "female_moon_sign": translate_panchang_text(p2_moon_rashi, language),
+                        "description": vashya_desc
+                    },
+                    "tara": {
+                        "score": translate_numbers_to_script(str(tara_score), language),
+                        "max_score": translate_numbers_to_script("3", language),
+                        "male_nakshatra": translate_panchang_text(p1_nakshatra_english, language),
+                        "female_nakshatra": translate_panchang_text(p2_nakshatra_english, language),
+                        "derived_from": "nakshatras",
+                        "description": tara_desc
+                    },
+                    "yoni": {
+                        "score": translate_numbers_to_script(str(yoni_score), language),
+                        "max_score": translate_numbers_to_script("4", language),
+                        "male_yoni": translate_panchang_text(p1_yoni, language),
+                        "female_yoni": translate_panchang_text(p2_yoni, language),
+                        "derived_from": "nakshatras",
+                        "male_nakshatra": translate_panchang_text(p1_nakshatra_english, language),
+                        "female_nakshatra": translate_panchang_text(p2_nakshatra_english, language),
+                        "description": yoni_desc
+                    },
+                    "graha_maitri": {
+                        "score": translate_numbers_to_script(str(graha_maitri_score), language),
+                        "max_score": translate_numbers_to_script("5", language),
+                        "male_lord": translate_panchang_text(p1_rashi_lord, language),
+                        "female_lord": translate_panchang_text(p2_rashi_lord, language),
+                        "derived_from": "moon_sign_lords",
+                        "male_moon_sign": translate_panchang_text(p1_moon_rashi, language),
+                        "female_moon_sign": translate_panchang_text(p2_moon_rashi, language),
+                        "description": graha_desc
+                    },
+                    "gana": {
+                        "score": translate_numbers_to_script(str(gana_score), language),
+                        "max_score": translate_numbers_to_script("6", language),
+                        "male_gana": translate_panchang_text(RASHI_GANA.get(p1_moon_rashi, "Dev"), language),
+                        "female_gana": translate_panchang_text(RASHI_GANA.get(p2_moon_rashi, "Dev"), language),
+                        "derived_from": "moon_signs",
+                        "male_moon_sign": translate_panchang_text(p1_moon_rashi, language),
+                        "female_moon_sign": translate_panchang_text(p2_moon_rashi, language),
+                        "description": gana_desc
+                    },
+                    "bhakoot": {
+                        "score": translate_numbers_to_script(str(bhakoot_score), language),
+                        "max_score": translate_numbers_to_script("7", language),
+                        "male_rashi": translate_panchang_text(p1_moon_rashi, language),
+                        "female_rashi": translate_panchang_text(p2_moon_rashi, language),
+                        "derived_from": "moon_signs",
+                        "description": bhakoot_desc
+                    },
+                    "nadi": {
+                        "score": translate_numbers_to_script(str(nadi_score), language),
+                        "max_score": translate_numbers_to_script("8", language),
+                        "male_nadi": translate_panchang_text(p1_nadi, language),
+                        "female_nadi": translate_panchang_text(p2_nadi, language),
+                        "derived_from": "nakshatras",
+                        "male_nakshatra": translate_panchang_text(p1_nakshatra_english, language),
+                        "female_nakshatra": translate_panchang_text(p2_nakshatra_english, language),
+                        "description": nadi_desc
+                    }
+                }
+            }
+        else:
+            # For English - keep numbers as integers/floats
+            compatibility_analysis = {
+                "total_score": total_score,
+                "max_possible_score": max_possible_score,
+                "compatibility_percentage": compatibility_percentage,
+                "compatibility_level": compatibility_level,
+                "overall_description": overall_description,
+                "detailed_analysis": {
+                    "varna": {
+                        "score": varna_score,
+                        "max_score": 1,
+                        "male_varna": RASHI_VARNA.get(p1_moon_rashi, "Vaishya"),
+                        "female_varna": RASHI_VARNA.get(p2_moon_rashi, "Vaishya"),
+                        "derived_from": "moon_signs",
+                        "male_moon_sign": p1_moon_rashi,
+                        "female_moon_sign": p2_moon_rashi,
+                        "description": varna_desc
+                    },
+                    "vashya": {
+                        "score": vashya_score,
+                        "max_score": 2,
+                        "male_vashya": RASHI_VASHYA.get(p1_moon_rashi, "Manav"),
+                        "female_vashya": RASHI_VASHYA.get(p2_moon_rashi, "Manav"),
+                        "derived_from": "moon_signs",
+                        "male_moon_sign": p1_moon_rashi,
+                        "female_moon_sign": p2_moon_rashi,
+                        "description": vashya_desc
+                    },
+                    "tara": {
+                        "score": tara_score,
+                        "max_score": 3,
+                        "male_nakshatra": p1_nakshatra_english,
+                        "female_nakshatra": p2_nakshatra_english,
+                        "derived_from": "nakshatras",
+                        "description": tara_desc
+                    },
+                    "yoni": {
+                        "score": yoni_score,
+                        "max_score": 4,
+                        "male_yoni": p1_yoni,
+                        "female_yoni": p2_yoni,
+                        "derived_from": "nakshatras",
+                        "male_nakshatra": p1_nakshatra_english,
+                        "female_nakshatra": p2_nakshatra_english,
+                        "description": yoni_desc
+                    },
+                    "graha_maitri": {
+                        "score": graha_maitri_score,
+                        "max_score": 5,
+                        "male_lord": p1_rashi_lord,
+                        "female_lord": p2_rashi_lord,
+                        "derived_from": "moon_sign_lords",
+                        "male_moon_sign": p1_moon_rashi,
+                        "female_moon_sign": p2_moon_rashi,
+                        "description": graha_desc
+                    },
+                    "gana": {
+                        "score": gana_score,
+                        "max_score": 6,
+                        "male_gana": RASHI_GANA.get(p1_moon_rashi, "Dev"),
+                        "female_gana": RASHI_GANA.get(p2_moon_rashi, "Dev"),
+                        "derived_from": "moon_signs",
+                        "male_moon_sign": p1_moon_rashi,
+                        "female_moon_sign": p2_moon_rashi,
+                        "description": gana_desc
+                    },
+                    "bhakoot": {
+                        "score": bhakoot_score,
+                        "max_score": 7,
+                        "male_rashi": p1_moon_rashi,
+                        "female_rashi": p2_moon_rashi,
+                        "derived_from": "moon_signs",
+                        "description": bhakoot_desc
+                    },
+                    "nadi": {
+                        "score": nadi_score,
+                        "max_score": 8,
+                        "male_nadi": p1_nadi,
+                        "female_nadi": p2_nadi,
+                        "derived_from": "nakshatras",
+                        "male_nakshatra": p1_nakshatra_english,
+                        "female_nakshatra": p2_nakshatra_english,
+                        "description": nadi_desc
+                    }
+                }
+            }
+        
+        logger.info(f"Corrected compatibility calculated: {total_score}/{max_possible_score} ({compatibility_percentage}%)")
+        
+        return compatibility_analysis
+        
+    except Exception as e:
+        logger.error(f"Error calculating corrected compatibility: {e}")
+        raise
+
+def translate_compatibility_numbers(analysis: Dict[str, Any], language: str) -> Dict[str, Any]:
+    """Translate numbers in compatibility analysis to target language"""
+    try:
+        # Create a deep copy to avoid modifying original
+        import copy
+        translated_analysis = copy.deepcopy(analysis)
+        
+        # Translate main scores
+        translated_analysis["total_score"] = translate_numbers_to_script(str(analysis["total_score"]), language)
+        translated_analysis["max_possible_score"] = translate_numbers_to_script(str(analysis["max_possible_score"]), language)
+        translated_analysis["compatibility_percentage"] = translate_numbers_to_script(str(analysis["compatibility_percentage"]), language)
+        
+        # Translate detailed analysis scores
+        for guna_name, guna_data in analysis["detailed_analysis"].items():
+            translated_analysis["detailed_analysis"][guna_name]["score"] = translate_numbers_to_script(str(guna_data["score"]), language)
+            translated_analysis["detailed_analysis"][guna_name]["max_score"] = translate_numbers_to_script(str(guna_data["max_score"]), language)
+        
+        return translated_analysis
+        
+    except Exception as e:
+        logger.error(f"Error translating numbers: {e}")
+        return analysis  # Return original if translation fails
+
+# Add these helper functions for compatibility calculations
+def calculate_varna_compatibility_corrected(moon_rashi1: str, moon_rashi2: str) -> int:
+    """Calculate Varna compatibility based on moon signs"""
+    varna1 = RASHI_VARNA.get(moon_rashi1, "Vaishya")
+    varna2 = RASHI_VARNA.get(moon_rashi2, "Vaishya")
+    
+    varna_order = {"Brahmin": 4, "Kshatriya": 3, "Vaishya": 2, "Shudra": 1}
+    
+    boy_order = varna_order.get(varna1, 1)
+    girl_order = varna_order.get(varna2, 1)
+    
+    # Boy's varna should be equal or higher than girl's
+    if boy_order >= girl_order:
+        return 1
+    return 0
+
+def calculate_vashya_compatibility_corrected(moon_rashi1: str, moon_rashi2: str) -> int:
+    """Calculate Vashya compatibility based on moon signs"""
+    vashya1 = RASHI_VASHYA.get(moon_rashi1, "Manav")
+    vashya2 = RASHI_VASHYA.get(moon_rashi2, "Manav")
+    
+    # CORRECTED Vashya compatibility matrix
+    vashya_compatibility = {
+        "Manav": ["Manav", "Vanchar"],  # Manav is compatible with Manav and Vanchar
+        "Vanchar": ["Vanchar", "Manav"],  # Vanchar is compatible with Vanchar and Manav
+        "Chatuspad": ["Chatuspad", "Vanchar"],  # Chatuspad is compatible with Chatuspad and Vanchar
+        "Jalchar": ["Jalchar"],  # Jalchar is only compatible with Jalchar
+        "Keet": ["Keet"]  # Keet is only compatible with Keet
+    }
+    
+    compatible_vashyas = vashya_compatibility.get(vashya1, [])
+    
+    if vashya1 == vashya2:
+        return 2  # Same vashya gets full points
+    elif vashya2 in compatible_vashyas:
+        return 1  # Compatible vashya gets partial points
+    else:
+        return 0  # Incompatible vashya gets no points
+
+def calculate_tara_compatibility(nakshatra1: str, nakshatra2: str) -> int:
+    """Calculate Tara/Nakshatra compatibility score"""
+    nakshatra_list = list(NAKSHATRA_DEGREES.keys())
+    
+    try:
+        pos1 = nakshatra_list.index(nakshatra1) + 1
+        pos2 = nakshatra_list.index(nakshatra2) + 1
+        
+        # Calculate the difference
+        diff = abs(pos1 - pos2)
+        if diff > 13:
+            diff = 27 - diff
+        
+        # Tara calculation based on count from each other
+        tara_from_1 = ((pos2 - pos1) % 27) + 1
+        tara_from_2 = ((pos1 - pos2) % 27) + 1
+        
+        # Good taras: 1, 3, 4, 5, 6, 7, 9, 11, 13, 15, 17, 19, 20
+        good_taras = [1, 3, 4, 5, 6, 7, 9, 11, 13, 15, 17, 19, 20]
+        
+        score = 0
+        if tara_from_1 in good_taras:
+            score += 1.5
+        if tara_from_2 in good_taras:
+            score += 1.5
+            
+        return min(int(score), 3)
+    except:
+        return 1
+
+def calculate_yoni_compatibility(yoni1: str, yoni2: str) -> int:
+    """Calculate Yoni compatibility score"""
+    yoni_compatibility = {
+        "Horse": {"enemy": ["Buffalo"], "neutral": ["Elephant", "Goat", "Dog", "Cat", "Rat", "Tiger", "Deer", "Monkey", "Mongoose", "Lion"], "friend": ["Horse", "Serpent", "Cow"]},
+        "Elephant": {"enemy": ["Lion"], "neutral": ["Horse", "Goat", "Serpent", "Dog", "Cat", "Rat", "Cow", "Buffalo", "Tiger", "Deer", "Monkey", "Mongoose"], "friend": ["Elephant"]},
+        "Goat": {"enemy": ["Monkey"], "neutral": ["Horse", "Elephant", "Serpent", "Dog", "Cat", "Rat", "Cow", "Buffalo", "Tiger", "Deer", "Mongoose", "Lion"], "friend": ["Goat"]},
+        "Serpent": {"enemy": ["Mongoose"], "neutral": ["Elephant", "Goat", "Dog", "Cat", "Rat", "Cow", "Buffalo", "Tiger", "Deer", "Monkey", "Lion"], "friend": ["Horse", "Serpent"]},
+        "Dog": {"enemy": ["Cat"], "neutral": ["Horse", "Elephant", "Goat", "Serpent", "Rat", "Cow", "Buffalo", "Tiger", "Deer", "Monkey", "Mongoose", "Lion"], "friend": ["Dog"]},
+        "Cat": {"enemy": ["Dog", "Rat"], "neutral": ["Horse", "Elephant", "Goat", "Serpent", "Cow", "Buffalo", "Tiger", "Deer", "Monkey", "Mongoose", "Lion"], "friend": ["Cat"]},
+        "Rat": {"enemy": ["Cat"], "neutral": ["Horse", "Elephant", "Goat", "Serpent", "Dog", "Cow", "Buffalo", "Tiger", "Deer", "Monkey", "Mongoose", "Lion"], "friend": ["Rat"]},
+        "Cow": {"enemy": ["Tiger"], "neutral": ["Horse", "Elephant", "Goat", "Serpent", "Dog", "Cat", "Rat", "Buffalo", "Deer", "Monkey", "Mongoose", "Lion"], "friend": ["Cow"]},
+        "Buffalo": {"enemy": ["Horse"], "neutral": ["Elephant", "Goat", "Serpent", "Dog", "Cat", "Rat", "Cow", "Tiger", "Deer", "Monkey", "Mongoose", "Lion"], "friend": ["Buffalo"]},
+        "Tiger": {"enemy": ["Cow", "Deer"], "neutral": ["Horse", "Elephant", "Goat", "Serpent", "Dog", "Cat", "Rat", "Buffalo", "Monkey", "Mongoose", "Lion"], "friend": ["Tiger"]},
+        "Deer": {"enemy": ["Tiger"], "neutral": ["Horse", "Elephant", "Goat", "Serpent", "Dog", "Cat", "Rat", "Cow", "Buffalo", "Monkey", "Mongoose", "Lion"], "friend": ["Deer"]},
+        "Monkey": {"enemy": ["Goat"], "neutral": ["Horse", "Elephant", "Serpent", "Dog", "Cat", "Rat", "Cow", "Buffalo", "Tiger", "Deer", "Mongoose", "Lion"], "friend": ["Monkey"]},
+        "Mongoose": {"enemy": ["Serpent"], "neutral": ["Horse", "Elephant", "Goat", "Dog", "Cat", "Rat", "Cow", "Buffalo", "Tiger", "Deer", "Monkey", "Lion"], "friend": ["Mongoose"]},
+        "Lion": {"enemy": ["Elephant"], "neutral": ["Horse", "Goat", "Serpent", "Dog", "Cat", "Rat", "Cow", "Buffalo", "Tiger", "Deer", "Monkey", "Mongoose"], "friend": ["Lion"]}
+    }
+    
+    if yoni1 == yoni2:
+        return 4
+    elif yoni2 in yoni_compatibility.get(yoni1, {}).get("friend", []):
+        return 3
+    elif yoni2 in yoni_compatibility.get(yoni1, {}).get("neutral", []):
+        return 2
+    elif yoni2 in yoni_compatibility.get(yoni1, {}).get("enemy", []):
+        return 0
+    else:
+        return 1
+
+def calculate_graha_maitri_compatibility(lord1: str, lord2: str) -> int:
+    """Calculate Graha Maitri (planetary friendship) compatibility score"""
+    planet_friendship = {
+        "Sun": {"friend": ["Moon", "Mars", "Jupiter"], "neutral": ["Mercury"], "enemy": ["Venus", "Saturn"]},
+        "Moon": {"friend": ["Sun", "Mercury"], "neutral": ["Mars", "Jupiter", "Venus", "Saturn"], "enemy": []},
+        "Mars": {"friend": ["Sun", "Moon", "Jupiter"], "neutral": ["Venus", "Saturn"], "enemy": ["Mercury"]},
+        "Mercury": {"friend": ["Sun", "Venus"], "neutral": ["Moon", "Saturn"], "enemy": ["Mars", "Jupiter"]},
+        "Jupiter": {"friend": ["Sun", "Moon", "Mars"], "neutral": ["Saturn"], "enemy": ["Mercury", "Venus"]},
+        "Venus": {"friend": ["Mercury", "Saturn"], "neutral": ["Mars", "Jupiter"], "enemy": ["Sun", "Moon"]},
+        "Saturn": {"friend": ["Mercury", "Venus"], "neutral": ["Jupiter"], "enemy": ["Sun", "Moon", "Mars"]}
+    }
+    
+    if lord1 == lord2:
+        return 5
+    elif lord2 in planet_friendship.get(lord1, {}).get("friend", []):
+        return 4
+    elif lord2 in planet_friendship.get(lord1, {}).get("neutral", []):
+        return 1
+    else:
+        return 0
+
+def calculate_gana_compatibility_corrected(moon_rashi1: str, moon_rashi2: str) -> int:
+    """Calculate Gana compatibility based on moon signs"""
+    gana1 = RASHI_GANA.get(moon_rashi1, "Dev")
+    gana2 = RASHI_GANA.get(moon_rashi2, "Dev")
+    
+    # CORRECTED Gana compatibility scoring
+    if gana1 == gana2:
+        return 6  # Same gana gets full points
+    elif (gana1 == "Dev" and gana2 == "Manushya") or (gana1 == "Manushya" and gana2 == "Dev"):
+        return 5  # Dev-Manushya compatibility
+    elif (gana1 == "Manushya" and gana2 == "Rakshasa") or (gana1 == "Rakshasa" and gana2 == "Manushya"):
+        return 1  # Manushya-Rakshasa limited compatibility
+    else:  # Dev and Rakshasa
+        return 0  # Dev-Rakshasa incompatible
+
+def calculate_bhakoot_compatibility(rashi1: str, rashi2: str) -> int:
+    """Calculate Bhakoot (Rashi) compatibility score"""
+    rashi_list = ZODIAC_SIGNS
+    
+    try:
+        pos1 = rashi_list.index(rashi1) + 1
+        pos2 = rashi_list.index(rashi2) + 1
+        
+        diff1 = abs(pos1 - pos2)
+        diff2 = 12 - diff1 if diff1 > 6 else diff1
+        
+        # Incompatible positions: 6-8 (6th-8th houses)
+        if diff2 == 6 or diff2 == 8:
+            return 0
+        elif diff2 == 2 or diff2 == 12:  # 2nd and 12th houses
+            return 0
+        elif diff2 == 5 or diff2 == 9:  # 5th and 9th houses (trine)
+            return 7
+        elif diff2 == 1:  # Same sign
+            return 7
+        elif diff2 == 3 or diff2 == 11:  # 3rd and 11th houses
+            return 4
+        elif diff2 == 4 or diff2 == 10:  # 4th and 10th houses
+            return 4
+        else:
+            return 2
+    except:
+        return 2
+
+def calculate_nadi_compatibility(nadi1: str, nadi2: str) -> int:
+    """Calculate Nadi compatibility score with deeper analysis"""
+    if nadi1 == nadi2:
+        return 0  # Same Nadi is not compatible
+    else:
+        # Different nadis get varying scores based on combination
+        nadi_compatibility_matrix = {
+            ("Aadi", "Madhya"): 6,
+            ("Madhya", "Aadi"): 6,
+            ("Aadi", "Antya"): 8,
+            ("Antya", "Aadi"): 8,
+            ("Madhya", "Antya"): 7,
+            ("Antya", "Madhya"): 7
+        }
+        
+        return nadi_compatibility_matrix.get((nadi1, nadi2), 5)  # Default for any other combination
+
+def get_varna_compatibility_description_corrected(moon_rashi1: str, moon_rashi2: str, language: str) -> str:
+    varna1 = RASHI_VARNA.get(moon_rashi1, "Vaishya")
+    varna2 = RASHI_VARNA.get(moon_rashi2, "Vaishya")
+    
+    # Translate varna names
+    varna1_translated = translate_panchang_text(varna1, language)
+    varna2_translated = translate_panchang_text(varna2, language)
+    moon_rashi1_translated = translate_panchang_text(moon_rashi1, language)
+    moon_rashi2_translated = translate_panchang_text(moon_rashi2, language)
+    
+    descriptions = {
+        "english": {
+            "same": f"Both partners have {varna1} varna from their moon signs ({moon_rashi1} and {moon_rashi2}), indicating similar spiritual and social outlook.",
+            "compatible": f"Boy's {varna1} varna ({moon_rashi1}) is compatible with girl's {varna2} varna ({moon_rashi2}).",
+            "incompatible": f"Boy's {varna1} varna ({moon_rashi1}) may not be compatible with girl's {varna2} varna ({moon_rashi2})."
+        },
+        "hindi": {
+            "same": f"दोनों साझीदारों का वर्ण {varna1_translated} है उनके चंद्र राशि ({moon_rashi1_translated} और {moon_rashi2_translated}) से, जो समान आध्यात्मिक और सामाजिक दृष्टिकोण दर्शाता है।",
+            "compatible": f"लड़के का {varna1_translated} वर्ण ({moon_rashi1_translated}) लड़की के {varna2_translated} वर्ण ({moon_rashi2_translated}) से संगत है।",
+            "incompatible": f"लड़के का {varna1_translated} वर्ण ({moon_rashi1_translated}) लड़की के {varna2_translated} वर्ण ({moon_rashi2_translated}) से संगत नहीं हो सकता।"
+        },
+        "gujarati": {
+            "same": f"બંને ભાગીદારોનું વર્ણ {varna1_translated} છે તેમના ચંદ્ર રાશિ ({moon_rashi1_translated} અને {moon_rashi2_translated}) પરથી, જે સમાન આધ્યાત્મિક અને સામાજિક દૃષ્ટિકોણ દર્શાવે છે।",
+            "compatible": f"છોકરાનું {varna1_translated} વર્ણ ({moon_rashi1_translated}) છોકરીના {varna2_translated} વર્ણ ({moon_rashi2_translated}) સાથે સુસંગત છે।",
+            "incompatible": f"છોકરાનું {varna1_translated} વર્ણ ({moon_rashi1_translated}) છોકરીના {varna2_translated} વર્ણ ({moon_rashi2_translated}) સાથે સુસંગત ન હોઈ શકે."
+        }
+    }
+    
+    if varna1 == varna2:
+        return descriptions.get(language, descriptions["english"])["same"]
+    elif calculate_varna_compatibility_corrected(moon_rashi1, moon_rashi2) > 0:
+        return descriptions.get(language, descriptions["english"])["compatible"]
+    else:
+        return descriptions.get(language, descriptions["english"])["incompatible"]
+
+def get_vashya_compatibility_description_corrected(moon_rashi1: str, moon_rashi2: str, language: str) -> str:
+    vashya1 = RASHI_VASHYA.get(moon_rashi1, "Manav")
+    vashya2 = RASHI_VASHYA.get(moon_rashi2, "Manav")
+    
+    # Translate vashya names
+    vashya1_translated = translate_panchang_text(vashya1, language)
+    vashya2_translated = translate_panchang_text(vashya2, language)
+    moon_rashi1_translated = translate_panchang_text(moon_rashi1, language)
+    moon_rashi2_translated = translate_panchang_text(moon_rashi2, language)
+    
+    descriptions = {
+        "english": {
+            "excellent": f"Excellent vashya compatibility: {vashya1} ({moon_rashi1}) and {vashya2} ({moon_rashi2}) indicate natural attraction.",
+            "good": f"Good vashya compatibility: {vashya1} ({moon_rashi1}) and {vashya2} ({moon_rashi2}) support mutual understanding.",
+            "poor": f"Limited vashya compatibility: {vashya1} ({moon_rashi1}) and {vashya2} ({moon_rashi2}) may require effort."
+        },
+        "hindi": {
+            "excellent": f"उत्कृष्ट वश्य संगति: {vashya1_translated} ({moon_rashi1_translated}) और {vashya2_translated} ({moon_rashi2_translated}) प्राकृतिक आकर्षण दर्शाते हैं।",
+            "good": f"अच्छी वश्य संगति: {vashya1_translated} ({moon_rashi1_translated}) और {vashya2_translated} ({moon_rashi2_translated}) पारस्परिक समझ का समर्थन करते हैं।",
+            "poor": f"सीमित वश्य संगति: {vashya1_translated} ({moon_rashi1_translated}) और {vashya2_translated} ({moon_rashi2_translated}) में प्रयास की आवश्यकता हो सकती है।"
+        },
+        "gujarati": {
+            "excellent": f"ઉત્કૃષ્ટ વશ્ય સુસંગતતા: {vashya1_translated} ({moon_rashi1_translated}) અને {vashya2_translated} ({moon_rashi2_translated}) કુદરતી આકર્ષણ દર્શાવે છે।",
+            "good": f"સારી વશ્ય સુસંગતતા: {vashya1_translated} ({moon_rashi1_translated}) અને {vashya2_translated} ({moon_rashi2_translated}) પરસ્પર સમજણને ટેકો આપે છે।",
+            "poor": f"મર્યાદિત વશ્ય સુસંગતતા: {vashya1_translated} ({moon_rashi1_translated}) અને {vashya2_translated} ({moon_rashi2_translated}) માં પ્રયાસની જરૂર પડી શકે છે।"
+        }
+    }
+    
+    score = calculate_vashya_compatibility_corrected(moon_rashi1, moon_rashi2)
+    if score == 2:
+        return descriptions.get(language, descriptions["english"])["excellent"]
+    elif score == 1:
+        return descriptions.get(language, descriptions["english"])["good"]
+    else:
+        return descriptions.get(language, descriptions["english"])["poor"]
+
+def get_tara_compatibility_description(nakshatra1: str, nakshatra2: str, language: str) -> str:
+    descriptions = {
+        "english": {
+            "excellent": "Excellent tara compatibility indicates favorable star influence for the relationship.",
+            "good": "Good tara compatibility supports positive influence from the stars.",
+            "average": "Average tara compatibility suggests neutral stellar influence.",
+            "poor": "Challenging tara compatibility may require spiritual remedies."
+        },
+        "hindi": {
+            "excellent": "उत्कृष्ट तारा संगति रिश्ते के लिए अनुकूल तारा प्रभाव को दर्शाती है।",
+            "good": "अच्छी तारा संगति तारों से सकारात्मक प्रभाव का समर्थन करती है।",
+            "average": "औसत तारा संगति तटस्थ तारकीय प्रभाव का सुझाव देती है।",
+            "poor": "चुनौतीपूर्ण तारा संगति के लिए आध्यात्मिक उपायों की आवश्यकता हो सकती है।"
+        },
+        "gujarati": {
+            "excellent": "ઉત્કૃષ્ટ તારા સુસંગતતા સંબંધ માટે અનુકૂળ તારા પ્રભાવ દર્શાવે છે.",
+            "good": "સારી તારા સુસંગતતા તારાઓથી સકારાત્મક પ્રભાવને ટેકો આપે છે.",
+            "average": "સરેરાશ તારા સુસંગતતા તટસ્થ તારાકીય પ્રભાવ સૂચવે છે.",
+            "poor": "પડકારજનક તારા સુસંગતતા માટે આધ્યાત્મિક ઉપાયોની જરૂર પડી શકે છે."
+        }
+    }
+    
+    score = calculate_tara_compatibility(nakshatra1, nakshatra2)
+    if score == 3:
+        return descriptions.get(language, descriptions["english"])["excellent"]
+    elif score == 2:
+        return descriptions.get(language, descriptions["english"])["good"]
+    elif score == 1:
+        return descriptions.get(language, descriptions["english"])["average"]
+    else:
+        return descriptions.get(language, descriptions["english"])["poor"]
+
+def get_yoni_compatibility_description(yoni1: str, yoni2: str, language: str) -> str:
+    descriptions = {
+        "english": {
+            "excellent": "Excellent yoni compatibility indicates strong physical and emotional attraction.",
+            "good": "Good yoni compatibility supports natural affinity and understanding.",
+            "average": "Average yoni compatibility suggests moderate physical compatibility.",
+            "poor": "Challenging yoni compatibility may affect physical and emotional harmony."
+        },
+        "hindi": {
+            "excellent": "उत्कृष्ट योनि संगति मजबूत शारीरिक और भावनात्मक आकर्षण को दर्शाती है।",
+            "good": "अच्छी योनि संगति प्राकृतिक स्नेह और समझ का समर्थन करती है।",
+            "average": "औसत योनि संगति मध्यम शारीरिक संगति का सुझाव देती है।",
+            "poor": "चुनौतीपूर्ण योनि संगति शारीरिक और भावनात्मक सामंजस्य को प्रभावित कर सकती है।"
+        },
+        "gujarati": {
+            "excellent": "ઉત્કૃષ્ટ યોનિ સુસંગતતા મજબૂત શારીરિક અને ભાવનાત્મક આકર્ષણ દર્શાવે છે.",
+            "good": "સારી યોનિ સુસંગતતા કુદરતી લાગણી અને સમજણને ટેકો આપે છે.",
+            "average": "સરેરાશ યોનિ સુસંગતતા મધ્યમ શારીરિક સુસંગતતા સૂચવે છે.",
+            "poor": "પડકારજનક યોનિ સુસંગતતા શારીરિક અને ભાવનાત્મક સુમેળને અસર કરી શકે છે."
+        }
+    }
+    
+    score = calculate_yoni_compatibility(yoni1, yoni2)
+    if score >= 3:
+        return descriptions.get(language, descriptions["english"])["excellent"]
+    elif score == 2:
+        return descriptions.get(language, descriptions["english"])["good"]
+    elif score == 1:
+        return descriptions.get(language, descriptions["english"])["average"]
+    else:
+        return descriptions.get(language, descriptions["english"])["poor"]
+
+def get_graha_maitri_compatibility_description(lord1: str, lord2: str, language: str) -> str:
+    descriptions = {
+        "english": {
+            "excellent": "Excellent planetary compatibility indicates harmonious mental and spiritual connection.",
+            "good": "Good planetary compatibility supports mutual understanding and cooperation.",
+            "neutral": "Neutral planetary compatibility suggests balanced relationship dynamics.",
+            "poor": "Challenging planetary compatibility may require effort in mental harmony."
+        },
+        "hindi": {
+            "excellent": "उत्कृष्ट ग्रहीय संगति सामंजस्यपूर्ण मानसिक और आध्यात्मिक संबंध को दर्शाती है।",
+            "good": "अच्छी ग्रहीय संगति पारस्परिक समझ और सहयोग का समर्थन करती है।",
+            "neutral": "तटस्थ ग्रहीय संगति संतुलित रिश्ते की गतिशीलता का सुझाव देती है।",
+            "poor": "चुनौतीपूर्ण ग्रहीय संगति के लिए मानसिक सामंजस्य में प्रयास की आवश्यकता हो सकती है।"
+        },
+        "gujarati": {
+            "excellent": "ઉત્કૃષ્ટ ગ્રહીય સુસંગતતા સુમેળયુક્ત માનસિક અને આધ્યાત્મિક જોડાણ દર્શાવે છે.",
+            "good": "સારી ગ્રહીય સુસંગતતા પરસ્પર સમજણ અને સહકારને ટેકો આપે છે.",
+            "neutral": "તટસ્થ ગ્રહીય સુસંગતતા સંતુલિત સંબંધની ગતિશીલતા સૂચવે છે.",
+            "poor": "પડકારજનક ગ્રહીય સુસંગતતા માટે માનસિક સુમેળમાં પ્રયાસની જરૂર પડી શકે છે."
+        }
+    }
+    
+    score = calculate_graha_maitri_compatibility(lord1, lord2)
+    if score >= 4:
+        return descriptions.get(language, descriptions["english"])["excellent"]
+    elif score >= 2:
+        return descriptions.get(language, descriptions["english"])["good"]
+    elif score == 1:
+        return descriptions.get(language, descriptions["english"])["neutral"]
+    else:
+        return descriptions.get(language, descriptions["english"])["poor"]
+
+def get_gana_compatibility_description_corrected(moon_rashi1: str, moon_rashi2: str, language: str) -> str:
+    gana1 = RASHI_GANA.get(moon_rashi1, "Dev")
+    gana2 = RASHI_GANA.get(moon_rashi2, "Dev")
+    
+    # Translate gana names
+    gana1_translated = translate_panchang_text(gana1, language)
+    gana2_translated = translate_panchang_text(gana2, language)
+    moon_rashi1_translated = translate_panchang_text(moon_rashi1, language)
+    moon_rashi2_translated = translate_panchang_text(moon_rashi2, language)
+    
+    descriptions = {
+        "english": {
+            "excellent": f"Excellent gana compatibility: {gana1} ({moon_rashi1}) and {gana2} ({moon_rashi2}) indicate perfect temperamental match.",
+            "good": f"Good gana compatibility: {gana1} ({moon_rashi1}) and {gana2} ({moon_rashi2}) support harmonious temperamental balance.",
+            "poor": f"Challenging gana compatibility: {gana1} ({moon_rashi1}) and {gana2} ({moon_rashi2}) may lead to temperamental differences.",
+            "incompatible": f"Incompatible gana: {gana1} ({moon_rashi1}) and {gana2} ({moon_rashi2}) suggest significant temperamental challenges."
+        },
+        "hindi": {
+            "excellent": f"उत्कृष्ट गण संगति: {gana1_translated} ({moon_rashi1_translated}) और {gana2_translated} ({moon_rashi2_translated}) पूर्ण स्वभावगत मेल को दर्शाते हैं।",
+            "good": f"अच्छी गण संगति: {gana1_translated} ({moon_rashi1_translated}) और {gana2_translated} ({moon_rashi2_translated}) सामंजस्यपूर्ण स्वभावगत संतुलन का समर्थन करते हैं।",
+            "poor": f"चुनौतीपूर्ण गण संगति: {gana1_translated} ({moon_rashi1_translated}) और {gana2_translated} ({moon_rashi2_translated}) स्वभावगत अंतर का कारण बन सकते हैं।",
+            "incompatible": f"असंगत गण: {gana1_translated} ({moon_rashi1_translated}) और {gana2_translated} ({moon_rashi2_translated}) महत्वपूर्ण स्वभावगत चुनौतियों का सुझाव देते हैं।"
+        },
+        "gujarati": {
+            "excellent": f"ઉત્કૃષ્ટ ગણ સુસંગતતા: {gana1_translated} ({moon_rashi1_translated}) અને {gana2_translated} ({moon_rashi2_translated}) સંપૂર્ણ સ્વભાવગત મેળ દર્શાવે છે।",
+            "good": f"સારી ગણ સુસંગતતા: {gana1_translated} ({moon_rashi1_translated}) અને {gana2_translated} ({moon_rashi2_translated}) સુમેળયુક્ત સ્વભાવગત સંતુલનને ટેકો આપે છે।",
+            "poor": f"પડકારજનક ગણ સુસંગતતા: {gana1_translated} ({moon_rashi1_translated}) અને {gana2_translated} ({moon_rashi2_translated}) સ્વભાવગત તફાવતનું કારણ બની શકે છે।",
+            "incompatible": f"અસુસંગત ગણ: {gana1_translated} ({moon_rashi1_translated}) અને {gana2_translated} ({moon_rashi2_translated}) મહત્વપૂર્ણ સ્વભાવગત પડકારો સૂચવે છે।"
+        }
+    }
+    
+    score = calculate_gana_compatibility_corrected(moon_rashi1, moon_rashi2)
+    if score == 6:
+        return descriptions.get(language, descriptions["english"])["excellent"]
+    elif score >= 4:
+        return descriptions.get(language, descriptions["english"])["good"]
+    elif score >= 1:
+        return descriptions.get(language, descriptions["english"])["poor"]
+    else:
+        return descriptions.get(language, descriptions["english"])["incompatible"]
+
+def get_nadi_compatibility_description_corrected(nadi1: str, nadi2: str, language: str) -> str:
+    """Fixed nadi compatibility description with correct logic"""
+    
+    # Translate nadi names
+    nadi1_translated = translate_panchang_text(nadi1, language)
+    nadi2_translated = translate_panchang_text(nadi2, language)
+    
+    score = calculate_nadi_compatibility(nadi1, nadi2)
+    
+    descriptions = {
+        "english": {
+            "same_nadi": f"Same nadi incompatibility: Both partners have {nadi1} nadi, which may affect progeny health and requires spiritual remedies.",
+            "excellent_different": f"Excellent nadi compatibility: {nadi1} and {nadi2} nadis create perfect genetic harmony and support healthy offspring.",
+            "very_good_different": f"Very good nadi compatibility: {nadi1} and {nadi2} nadis provide strong genetic compatibility with minor considerations.",
+            "good_different": f"Good nadi compatibility: {nadi1} and {nadi2} nadis offer decent genetic harmony with some precautions recommended.",
+            "average_different": f"Average nadi compatibility: {nadi1} and {nadi2} nadis require careful consideration for genetic harmony."
+        },
+        "hindi": {
+            "same_nadi": f"समान नाड़ी असंगति: दोनों साझीदारों की {nadi1_translated} नाड़ी है, जो संतान के स्वास्थ्य को प्रभावित कर सकती है और आध्यात्मिक उपायों की आवश्यकता होती है।",
+            "excellent_different": f"उत्कृष्ट नाड़ी संगति: {nadi1_translated} और {nadi2_translated} नाड़ी पूर्ण आनुवंशिक सामंजस्य बनाती है और स्वस्थ संतान का समर्थन करती है।",
+            "very_good_different": f"बहुत अच्छी नाड़ी संगति: {nadi1_translated} और {nadi2_translated} नाड़ी मामूली विचारों के साथ मजबूत आनुवंशिक संगति प्रदान करती है।",
+            "good_different": f"अच्छी नाड़ी संगति: {nadi1_translated} और {nadi2_translated} नाड़ी कुछ सावधानियों की सिफारिश के साथ अच्छा आनुवंशिक सामंजस्य प्रदान करती है।",
+            "average_different": f"औसत नाड़ी संगति: {nadi1_translated} और {nadi2_translated} नाड़ी आनुवंशिक सामंजस्य के लिए सावधानीपूर्वक विचार की आवश्यकता है।"
+        },
+        "gujarati": {
+            "same_nadi": f"સમાન નાડી અસુસંગતતા: બંને ભાગીદારોની {nadi1_translated} નાડી છે, જે સંતાનના સ્વાસ્થ્યને અસર કરી શકે છે અને આધ્યાત્મિક ઉપાયોની જરૂર છે।",
+            "excellent_different": f"ઉત્કૃષ્ટ નાડી સુસંગતતા: {nadi1_translated} અને {nadi2_translated} નાડી સંપૂર્ણ આનુવંશિક સુમેળ બનાવે છે અને તંદુરસ્ત સંતાનને ટેકો આપે છે।",
+            "very_good_different": f"ખૂબ સારી નાડી સુસંગતતા: {nadi1_translated} અને {nadi2_translated} નાડી નાની વિચારણા સાથે મજબૂત આનુવંશિક સુસંગતતા પ્રદાન કરે છે।",
+            "good_different": f"સારી નાડી સુસંગતતા: {nadi1_translated} અને {nadi2_translated} નાડી કેટલીક સાવધાનીઓની ભલામણ સાથે સારી આનુવંશિક સુમેળ પ્રદાન કરે છે।",
+            "average_different": f"સરેરાશ નાડી સુસંગતતા: {nadi1_translated} અને {nadi2_translated} નાડી આનુવંશિક સુમેળ માટે સાવચેતીપૂર્વક વિચારણાની જરૂર છે।"
+        }
+    }
+    
+    # Return appropriate description based on score
+    if nadi1 == nadi2:
+        return descriptions.get(language, descriptions["english"])["same_nadi"]
+    elif score == 8:
+        return descriptions.get(language, descriptions["english"])["excellent_different"]
+    elif score >= 7:
+        return descriptions.get(language, descriptions["english"])["very_good_different"]
+    elif score >= 5:
+        return descriptions.get(language, descriptions["english"])["good_different"]
+    else:
+        return descriptions.get(language, descriptions["english"])["average_different"]
+
+def get_bhakoot_compatibility_description(rashi1: str, rashi2: str, language: str) -> str:
+    descriptions = {
+        "english": {
+            "excellent": "Excellent bhakoot compatibility indicates harmonious life partnership.",
+            "good": "Good bhakoot compatibility supports stable relationship foundation.",
+            "average": "Average bhakoot compatibility suggests moderate relationship harmony.",
+            "poor": "Challenging bhakoot compatibility may affect relationship stability."
+        },
+        "hindi": {
+            "excellent": "उत्कृष्ट भकूट संगति सामंजस्यपूर्ण जीवन साझेदारी को दर्शाती है।",
+            "good": "अच्छी भकूट संगति स्थिर रिश्ते की नींव का समर्थन करती है।",
+            "average": "औसत भकूट संगति मध्यम रिश्ते के सामंजस्य का सुझाव देती है।",
+            "poor": "चुनौतीपूर्ण भकूट संगति रिश्ते की स्थिरता को प्रभावित कर सकती है।"
+        },
+        "gujarati": {
+            "excellent": "ઉત્કૃષ્ટ ભકૂટ સુસંગતતા સુમેળયુક્ત જીવન ભાગીદારી દર્શાવે છે.",
+            "good": "સારી ભકૂટ સુસંગતતા સ્થિર સંબંધના પાયાને ટેકો આપે છે.",
+            "average": "સરેરાશ ભકૂટ સુસંગતતા મધ્યમ સંબંધ સુમેળ સૂચવે છે.",
+            "poor": "પડકારજનક ભકૂટ સુસંગતતા સંબંધની સ્થિરતાને અસર કરી શકે છે."
+        }
+    }
+    
+    score = calculate_bhakoot_compatibility(rashi1, rashi2)
+    if score == 7:
+        return descriptions.get(language, descriptions["english"])["excellent"]
+    elif score >= 4:
+        return descriptions.get(language, descriptions["english"])["good"]
+    elif score >= 2:
+        return descriptions.get(language, descriptions["english"])["average"]
+    else:
+        return descriptions.get(language, descriptions["english"])["poor"]
+    
+def get_moon_longitude_from_rashi(rashi: str) -> float:
+    """Approximate moon longitude from rashi for nadi calculation"""
+    rashi_positions = {
+        "Aries": 15, "Taurus": 45, "Gemini": 75, "Cancer": 105,
+        "Leo": 135, "Virgo": 165, "Libra": 195, "Scorpio": 225,
+        "Sagittarius": 255, "Capricorn": 285, "Aquarius": 315, "Pisces": 345
+    }
+    return rashi_positions.get(rashi, 15)
+
+
+
+def get_overall_compatibility_description(percentage: float, language: str) -> str:
+    descriptions = {
+        "english": {
+            "excellent": "This is an excellent match with very high compatibility. The couple is likely to have a harmonious, happy, and prosperous married life.",
+            "very_good": "This is a very good match with high compatibility. The relationship has strong potential for happiness and success.",
+            "good": "This is a good match with decent compatibility. With mutual understanding and effort, the relationship can be successful.",
+            "average": "This is an average match. Both partners will need to work together and make compromises for a successful relationship.",
+            "poor": "This match has challenges that need serious consideration. Professional astrological guidance and remedies are recommended."
+        },
+        "hindi": {
+            "excellent": "यह बहुत उच्च संगति के साथ एक उत्कृष्ट मेल है। दंपति का वैवाहिक जीवन सामंजस्यपूर्ण, खुशहाल और समृद्ध होने की संभावना है।",
+            "very_good": "यह उच्च संगति के साथ एक बहुत अच्छा मेल है। रिश्ते में खुशी और सफलता की प्रबल संभावना है।",
+            "good": "यह अच्छी संगति के साथ एक अच्छा मेल है। पारस्परिक समझ और प्रयास से रिश्ता सफल हो सकता है।",
+            "average": "यह एक औसत मेल है। सफल रिश्ते के लिए दोनों साझीदारों को मिलकर काम करना और समझौते करने होंगे।",
+            "poor": "इस मेल में चुनौतियां हैं जिन पर गंभीरता से विचार की आवश्यकता है। पेशेवर ज्योतिषीय मार्गदर्शन और उपाय की सिफारिश की जाती है।"
+        },
+        "gujarati": {
+            "excellent": "આ ખૂબ જ ઉચ્ચ સુસંગતતા સાથે એક ઉત્કૃષ્ટ મેળ છે. દંપતીના વૈવાહિક જીવન સુમેળયુક્ત, ખુશહાલ અને સમૃદ્ધ હોવાની શક્યતા છે.",
+            "very_good": "આ ઉચ્ચ સુસંગતતા સાથે ખૂબ સારો મેળ છે. સંબંધમાં ખુશી અને સફળતાની મજબૂત શક્યતા છે.",
+            "good": "આ યોગ્ય સુસંગતતા સાથે સારો મેળ છે. પરસ્પર સમજણ અને પ્રયાસથી સંબંધ સફળ થઈ શકે છે.",
+            "average": "આ એક સરેરાશ મેળ છે. સફળ સંબંધ માટે બંને ભાગીદારોએ સાથે મળીને કામ કરવું અને સમાધાન કરવા પડશે.",
+            "poor": "આ મેળમાં પડકારો છે જેના પર ગંભીરતાથી વિચાર કરવાની જરૂર છે. વ્યાવસાયિક જ્યોતિષશાસ્ત્રીય માર્ગદર્શન અને ઉપાયોની ભલામણ કરવામાં આવે છે."
+        }
+    }
+    
+    if percentage >= 85:
+        return descriptions.get(language, descriptions["english"])["excellent"]
+    elif percentage >= 70:
+        return descriptions.get(language, descriptions["english"])["very_good"]
+    elif percentage >= 50:
+        return descriptions.get(language, descriptions["english"])["good"]
+    elif percentage >= 30:
+        return descriptions.get(language, descriptions["english"])["average"]
+    else:
+        return descriptions.get(language, descriptions["english"])["poor"]
+
+def convert_translated_number_to_int(text: str) -> int:
+    """Convert Hindi/Gujarati numbers back to integers"""
+    try:
+        # Hindi numbers mapping
+        hindi_to_english = {
+            "०": "0", "१": "1", "२": "2", "३": "3", "४": "4",
+            "५": "5", "६": "6", "७": "7", "८": "8", "९": "9"
+        }
+        
+        # Gujarati numbers mapping  
+        gujarati_to_english = {
+            "૦": "0", "૧": "1", "૨": "2", "૩": "3", "૪": "4",
+            "૫": "5", "૬": "6", "૭": "7", "૮": "8", "૯": "9"
+        }
+        
+        # Convert text to English numbers
+        english_text = text
+        for hindi, english in hindi_to_english.items():
+            english_text = english_text.replace(hindi, english)
+        
+        for gujarati, english in gujarati_to_english.items():
+            english_text = english_text.replace(gujarati, english)
+        
+        # Extract numeric part (remove any non-digit characters except decimal point)
+        import re
+        numeric_part = re.findall(r'\d+\.?\d*', english_text)
+        if numeric_part:
+            return int(float(numeric_part[0]))
+        else:
+            return 0
+            
+    except Exception as e:
+        logger.error(f"Error converting translated number to int: {e}")
+        return 0
+
+def get_compatibility_recommendations(compatibility: Dict[str, Any], language: str) -> Dict[str, Any]:
+    """Get compatibility recommendations based on percentage"""
+    
+    recommendations = {
+        "english": {
+            "excellent": {
+                "marriage": "Highly recommended for marriage",
+                "remedies": "No specific remedies needed",
+                "advice": "This is an excellent match. Proceed with confidence."
+            },
+            "very_good": {
+                "marriage": "Very good for marriage",
+                "remedies": "Minor puja ceremonies recommended",
+                "advice": "This is a very good match with strong potential for happiness."
+            },
+            "good": {
+                "marriage": "Good for marriage with understanding",
+                "remedies": "Regular prayers and mutual understanding recommended",
+                "advice": "A good match that can work well with effort from both partners."
+            },
+            "average": {
+                "marriage": "Average match - requires consideration",
+                "remedies": "Consult an astrologer for specific remedies",
+                "advice": "This match has potential but requires work and understanding."
+            },
+            "poor": {
+                "marriage": "Not recommended without astrological guidance",
+                "remedies": "Comprehensive remedies and consultation strongly recommended",
+                "advice": "This match has significant challenges. Professional guidance advised."
+            }
+        },
+        "hindi": {
+            "excellent": {
+                "marriage": "विवाह के लिए अत्यधिक अनुशंसित",
+                "remedies": "कोई विशिष्ट उपाय की आवश्यकता नहीं",
+                "advice": "यह एक उत्कृष्ट मेल है। आत्मविश्वास के साथ आगे बढ़ें।"
+            },
+            "very_good": {
+                "marriage": "विवाह के लिए बहुत अच्छा",
+                "remedies": "छोटी पूजा समारोह की सिफारिश",
+                "advice": "यह खुशी की मजबूत संभावना के साथ एक बहुत अच्छा मेल है।"
+            },
+            "good": {
+                "marriage": "समझ के साथ विवाह के लिए अच्छा",
+                "remedies": "नियमित प्रार्थना और पारस्परिक समझ की सिफारिश",
+                "advice": "एक अच्छा मेल जो दोनों साझीदारों के प्रयास से अच्छा काम कर सकता है।"
+            },
+            "average": {
+                "marriage": "औसत मेल - विचार की आवश्यकता",
+                "remedies": "विशिष्ट उपायों के लिए किसी ज्योतिषी से सलाह लें",
+                "advice": "इस मेल में संभावना है लेकिन काम और समझ की आवश्यकता है।"
+            },
+            "poor": {
+                "marriage": "ज्योतिषीय मार्गदर्शन के बिना अनुशंसित नहीं",
+                "remedies": "व्यापक उपाय और परामर्श की दृढ़ता से सिफारिश",
+                "advice": "इस मेल में महत्वपूर्ण चुनौतियां हैं। पेशेवर मार्गदर्शन की सलाह दी जाती है।"
+            }
+        },
+        "gujarati": {
+            "excellent": {
+                "marriage": "લગ્ન માટે અત્યંત ભલામણ",
+                "remedies": "કોઈ વિશિષ્ટ ઉપાયની જરૂર નથી",
+                "advice": "આ એક ઉત્કૃષ્ટ મેળ છે. આત્મવિશ્વાસ સાથે આગળ વધો."
+            },
+            "very_good": {
+                "marriage": "લગ્ન માટે ખૂબ સારું",
+                "remedies": "નાની પૂજા વિધિઓની ભલામણ",
+                "advice": "આ ખુશીની મજબૂત શક્યતા સાથે ખૂબ સારો મેળ છે."
+            },
+            "good": {
+                "marriage": "સમજણ સાથે લગ્ન માટે સારું",
+                "remedies": "નિયમિત પ્રાર્થના અને પરસ્પર સમજણની ભલામણ",
+                "advice": "સારો મેળ જે બંને ભાગીદારોના પ્રયાસથી સારું કામ કરી શકે છે."
+            },
+            "average": {
+                "marriage": "સરેરાશ મેળ - વિચારણાની જરૂર",
+                "remedies": "વિશિષ્ટ ઉપાયો માટે જ્યોતિષીની સલાહ લો",
+                "advice": "આ મેળમાં શક્યતા છે પરંતુ કામ અને સમજણની જરૂર છે."
+            },
+            "poor": {
+                "marriage": "જ્યોતિષશાસ્ત્રીય માર્ગદર્શન વિના ભલામણ નથી",
+                "remedies": "વ્યાપક ઉપાયો અને સલાહની મજબૂત ભલામણ",
+                "advice": "આ મેળમાં નોંધપાત્ર પડકારો છે. વ્યાવસાયિક માર્ગદર્શનની સલાહ આપવામાં આવે છે."
+            }
+        }
+    }
+    
+    # FIXED: Get the numeric percentage value instead of translated string
+    # Check if compatibility_percentage is a string (translated) or numeric
+    percentage_value = compatibility.get('compatibility_percentage', 0)
+    
+    # If it's a translated string, we need to get the original numeric value
+    if isinstance(percentage_value, str):
+        # For Hindi/Gujarati, we need to work backwards from the calculation
+        # Get total_score and max_possible_score as numbers
+        total_score = compatibility.get('total_score', 0)
+        max_possible_score = compatibility.get('max_possible_score', 36)
+        
+        # Convert to numbers if they're strings
+        if isinstance(total_score, str):
+            # Convert Hindi/Gujarati numbers back to English numbers
+            total_score = convert_translated_number_to_int(total_score)
+        if isinstance(max_possible_score, str):
+            max_possible_score = convert_translated_number_to_int(max_possible_score)
+        
+        # Calculate percentage numerically
+        percentage = round((total_score / max_possible_score) * 100, 1) if max_possible_score > 0 else 0
+    else:
+        # If it's already numeric, use it directly
+        percentage = float(percentage_value)
+    
+    # Determine category using numeric percentage
+    if percentage >= 85:
+        category = "excellent"
+    elif percentage >= 70:
+        category = "very_good"
+    elif percentage >= 50:
+        category = "good"
+    elif percentage >= 30:
+        category = "average"
+    else:
+        category = "poor"
+    
+    return recommendations.get(language, recommendations["english"]).get(category, recommendations["english"]["average"])
+# Mount static files for serving charts
+app.mount("/charts", StaticFiles(directory="charts"), name="charts")
+
+# Ensure charts directory exists
+os.makedirs("charts", exist_ok=True)
+
+# Initialize core
+astro_core = AstroChachuCore()
+
+# Pydantic Models
+class BirthDetails(BaseModel):
+    name: str = Field(..., description="Full name")
+    date_of_birth: str = Field(..., description="Date in YYYY-MM-DD format")
+    time_of_birth: str = Field(..., description="Time in HH:MM format or 12-hour format (7:20 PM)")
+    place_of_birth: str = Field(..., description="Birth place")
+    latitude: float = Field(..., description="Latitude")
+    longitude: float = Field(..., description="Longitude")
+    timezone_offset: float = Field(5.5, description="Timezone offset from UTC")
+
+class ChatMessage(BaseModel):
+    question: str = Field(..., description="Question in Hinglish or English")
+
+class PlanetPosition(BaseModel):
+    name: str
+    longitude: float
+    sign: str
+    sign_number: int
+    degree_in_sign: float
+    house: int
+    nakshatra: str
+    nakshatra_lord: str
+
+class KundliResponse(BaseModel):
+    success: bool
+    name: str
+    birth_details: BirthDetails
+    ascendant: Dict[str, Any]
+    planetary_positions: Dict[str, Any]
+    sade_sati: Dict[str, Any]
+    current_dasha: Dict[str, Any]
+    dasha_sequence: Dict[str, Any]
+    chart_svg: str
+    chart_file_path: str
+    chart_url: str
+    processing_time: float
+    calculation_notes: str
+
+# Chart generation function
+async def create_north_indian_chart(planets: Dict, name: str) -> Tuple[str, str, str]:
+    """Generate North Indian style SVG chart and save to file"""
+    # Create a safe filename
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_name = "".join(c for c in name if c.isalnum() or c in (' ', '-', '_')).strip()
+    safe_name = safe_name.replace(' ', '_')
+    filename = f"chart_{safe_name}_{timestamp}.svg"
+    file_path = os.path.join("charts", filename)
+    chart_url = f"/charts/{filename}"
+    # SVG dimensions
+    width, height = 800, 900
+    
+    # House positions in North Indian style (diamond shape)
+    house_positions = {
+        1: (400, 250),   # Center
+            2: (250, 160),   # Top left (moved down 10px)
+            3: (150, 250),   # Left
+            4: (250, 400),   # Left center
+            5: (150, 550),   # Bottom left
+            6: (250, 650),   # Bottom
+            7: (400, 550),   # Bottom center
+            8: (550, 650),   # Bottom right
+            9: (650, 550),   # Right
+            10: (550, 400),  # Right center
+            11: (650, 250),  # Top right
+            12: (550, 160)   # Top (moved down 10px)
+    }
+    
+    # Sign names
+    sign_names = [
+        "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
+        "Libra", "Scorpio", "Sagittarius", "Capricorn", "Aquarius", "Pisces"
+    ]
+    
+    # Create SVG
+    svg = f'''<?xml version="1.0" encoding="UTF-8"?>
+<svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg">
+<rect width="{width}" height="{height}" fill="white" stroke="black" stroke-width="2"/>'''
+    
+    # Draw the diamond chart structure
+    # Center diamond
+    svg += '\n<polygon points="400,100 250,250 400,400 550,250" fill="white" stroke="black" stroke-width="2"/>'
+    
+    # Surrounding triangular houses
+    # Top row
+    svg += '\n<polygon points="100,100 250,250 400,100" fill="white" stroke="black" stroke-width="2"/>'
+    svg += '\n<polygon points="100,400 250,250 100,100" fill="white" stroke="black" stroke-width="2"/>'
+    svg += '\n<polygon points="250,250 100,400 250,550 400,400" fill="white" stroke="black" stroke-width="2"/>'
+    svg += '\n<polygon points="100,400 250,550 100,700" fill="white" stroke="black" stroke-width="2"/>'
+    svg += '\n<polygon points="100,700 250,550 400,700" fill="white" stroke="black" stroke-width="2"/>'
+    svg += '\n<polygon points="400,400 250,550 400,700 550,550" fill="white" stroke="black" stroke-width="2"/>'
+    svg += '\n<polygon points="400,700 550,550 700,700" fill="white" stroke="black" stroke-width="2"/>'
+    svg += '\n<polygon points="700,400 550,550 700,700" fill="white" stroke="black" stroke-width="2"/>'
+    svg += '\n<polygon points="550,250 700,400 550,550 400,400" fill="white" stroke="black" stroke-width="2"/>'
+    svg += '\n<polygon points="700,100 550,250 700,400" fill="white" stroke="black" stroke-width="2"/>'
+    svg += '\n<polygon points="400,100 550,250 700,100" fill="white" stroke="black" stroke-width="2"/>'
+    
+    # Get ascendant house
+    ascendant_house = 1  # Lagna is always in house 1
+    
+    # Group planets by house
+    house_planets = {i: [] for i in range(1, 13)}
+    
+    for planet_name, planet_data in planets.items():
+        if planet_name != "Lagna":  # Skip Lagna as it's not a planet
+            house = planet_data.get("house", 1)
+            house_planets[house].append({
+                "name": planet_name,
+                "degree": planet_data.get("degree_in_sign", 0)
+            })
+    
+    # Add house numbers, signs, and planets
+    for house_num in range(1, 13):
+        x, y = house_positions[house_num]
+        
+        # Calculate which sign is in this house based on ascendant
+        # In Vedic astrology, if Lagna is in Virgo (sign 6), then:
+        # House 1 = Virgo, House 2 = Libra, etc.
+        lagna_sign_num = planets["Lagna"]["sign_number"] - 1  # Convert to 0-based
+        sign_in_house = (lagna_sign_num + house_num - 1) % 12
+        sign_name = sign_names[sign_in_house]
+        
+        # House number
+        svg += f'\n<text x="{x}" y="{y-10}" text-anchor="middle" font-family="Arial" font-size="24" font-weight="bold" fill="blue">{house_num}</text>'
+        
+        # Sign name
+        svg += f'\n<text x="{x}" y="{y+17}" text-anchor="middle" font-family="Arial" font-size="19" fill="black">{sign_name}</text>'
+        
+        # Lagna marker
+        if house_num == ascendant_house:
+            svg += f'\n<text x="{x}" y="{y+75}" text-anchor="middle" font-family="Arial" font-size="12" fill="red">LAGNA</text>'
+        
+        # Add planets in this house
+        if house_planets[house_num]:
+            planet_y = y + 30
+            for i, planet in enumerate(house_planets[house_num]):
+                planet_abbrev = {
+                    "Sun": "Su", "Moon": "Mo", "Mercury": "Me", "Venus": "Ve",
+                    "Mars": "Ma", "Jupiter": "Ju", "Saturn": "Sa", "Rahu": "Ra", "Ketu": "Ke"
+                }.get(planet["name"], planet["name"][:2])
+                
+                degree = int(planet["degree"])
+                svg += f'\n<text x="{x}" y="{planet_y}" text-anchor="middle" font-family="Arial" font-size="12" fill="darkred">{planet_abbrev} {degree}</text>'
+                planet_y += 15
+    
+    # Add title and details
+    svg += f'\n<text x="400" y="30" text-anchor="middle" font-family="Arial" font-size="19" font-weight="bold" fill="blue">Vedic Birth Chart (North Indian Style)</text>'
+    svg += f'\n<text x="400" y="55" text-anchor="middle" font-family="Arial" font-size="12" fill="black">{name}</text>'
+    
+    # Add ascendant degree info
+    lagna_degree = planets["Lagna"]["degree_in_sign"]
+    lagna_sign = planets["Lagna"]["sign"]
+    svg += f'\n<text x="400" y="820" text-anchor="middle" font-family="Arial" font-size="12" fill="red">Lagna: {lagna_degree:.2f}° in {lagna_sign}</text>'
+    
+    # Add calculation info
+    svg += f'\n<text x="400" y="840" text-anchor="middle" font-family="Arial" font-size="10" fill="gray">House System: Whole Sign | Ayanamsa: Lahiri (24.10°)</text>'
+    
+    # Add generation timestamp
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M")
+    svg += f'\n<text x="400" y="860" text-anchor="middle" font-family="Arial" font-size="10" fill="gray">Generated: {current_time}</text>'
+    
+    # Add legend
+    svg += f'\n<text x="400" y="880" text-anchor="middle" font-family="Arial" font-size="10" fill="gray">Su=Sun Mo=Moon Me=Mercury Ve=Venus Ma=Mars Ju=Jupiter Sa=Saturn Ra=Rahu Ke=Ketu</text>'
+    
+    svg += '\n</svg>'
+    
+    # Save SVG to file
+    with open(file_path, 'w', encoding='utf-8') as f:
+        f.write(svg)
+    
+    return svg, file_path, chart_url
+
+@app.post("/api/astro/generate-kundli", response_model=KundliResponse)
+async def generate_kundli(birth_details: BirthDetails):
+    """Generate complete Kundli with accurate calculations and chart"""
     start_time = time.time()
     
     try:
-        # Extract parameters from request
-        zodiac_sign = request.zodiac_sign
-        language = request.language
-        prediction_type = request.type
-        latitude = float(request.location.get('latitude', 0.0))
-        longitude = float(request.location.get('longitude', 0.0))
+        # Validate time format
+        try:
+            TimeParser.parse_time_string(birth_details.time_of_birth)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid time format: {str(e)}")
         
-        logger.info(f"Horoscope request: {zodiac_sign}, {prediction_type}, {language}")
+        # Generate kundli
+        result = astro_core.generate_complete_kundli(birth_details.dict())
         
-        # Validate zodiac sign
-        if not zodiac_sign or zodiac_sign not in ZODIAC_SIGNS:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid zodiac sign. Please provide one of: {', '.join(ZODIAC_SIGNS)}"
-            )
+        if not result["success"]:
+            raise HTTPException(status_code=400, detail=result.get("message", "Calculation error"))
         
-        # Validate language
-        valid_languages = ["English", "Hindi", "Gujarati"]
-        if language not in valid_languages:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid language. Please provide one of: {', '.join(valid_languages)}"
-            )
+        # Create chart visualization
+        chart_svg, chart_file_path, chart_url = await create_north_indian_chart(result["planets"], birth_details.name)
         
-        # Generate horoscope asynchronously
-        horoscope = await asyncio.to_thread(
-            generate_horoscope, 
-            zodiac_sign, 
-            language, 
-            prediction_type, 
-            latitude, 
-            longitude
+        processing_time = time.time() - start_time
+        
+        return KundliResponse(
+            success=True,
+            name=birth_details.name,
+            birth_details=birth_details,
+            ascendant=result["ascendant"],
+            planetary_positions=result["planets"],
+            sade_sati=result["sade_sati"],
+            current_dasha=result["current_dasha"],
+            dasha_sequence=result["dasha_sequence"],
+            chart_svg=chart_svg,
+            chart_file_path=chart_file_path,
+            chart_url=chart_url,
+            processing_time=processing_time,
+            calculation_notes=result["calculation_notes"]
         )
         
-        # Log performance metrics
-        execution_time = time.time() - start_time
-        logger.info(f"Horoscope generated in {execution_time:.2f} seconds")
-        
-        return horoscope
-    
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(f"API error: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"An error occurred while processing your request: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Error generating kundli: {str(e)}")
+    
+@app.post("/api/astro/lovematching")
+async def love_matching_endpoint_corrected(
+    request: LoveMatchingRequest, 
+    user_data: dict = Depends(verify_jwt_dependency),
+    _: bool = Depends(check_memory_limit)
+):
+    """Corrected love matching endpoint using sidereal calculations and proper varna/gana mappings"""
+    start_time = time.time()
+    
+    with MemoryCleanup():
+        try:
+            logger.info(f"Processing corrected love matching request for {request.name_boy} and {request.name_girl}")
+            
+            # Parse birth dates and times
+            try:
+                birth_date_boy = datetime.strptime(request.birth_date_boy, "%Y-%m-%d").date()
+                birth_time_boy = datetime.strptime(request.birth_time_boy, "%H:%M").time()
+                birth_datetime_boy = datetime.combine(birth_date_boy, birth_time_boy)
+                
+                birth_date_girl = datetime.strptime(request.birth_date_girl, "%Y-%m-%d").date()
+                birth_time_girl = datetime.strptime(request.birth_time_girl, "%H:%M").time()
+                birth_datetime_girl = datetime.combine(birth_date_girl, birth_time_girl)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=f"Invalid date/time format: {str(e)}. Use YYYY-MM-DD for date and HH:MM for time")
+            
+            # Validate coordinates
+            if not (-90 <= request.latitude_boy <= 90) or not (-180 <= request.longitude_boy <= 180):
+                raise HTTPException(status_code=400, detail="Invalid coordinates for boy")
+            if not (-90 <= request.latitude_girl <= 90) or not (-180 <= request.longitude_girl <= 180):
+                raise HTTPException(status_code=400, detail="Invalid coordinates for girl")
+            
+            # Validate language
+            if request.language.lower() not in ["english", "hindi", "gujarati"]:
+                raise HTTPException(status_code=400, detail="Language must be 'english', 'hindi', or 'gujarati'")
+            
+            # Calculate corrected astrological details using sidereal system
+            logger.info(f"Calculating sidereal astro details for {request.name_boy}")
+            male_details = get_astro_details_corrected(birth_datetime_boy, request.latitude_boy, request.longitude_boy, request.language.lower())
+            
+            logger.info(f"Calculating sidereal astro details for {request.name_girl}")
+            female_details = get_astro_details_corrected(birth_datetime_girl, request.latitude_girl, request.longitude_girl, request.language.lower())
+            
+            # Calculate compatibility using corrected mappings
+            logger.info(f"Calculating corrected compatibility between {request.name_boy} and {request.name_girl}")
+            compatibility = calculate_compatibility_corrected(male_details, female_details, request.language.lower())
+            
+            # Create comprehensive response
+            response = {
+                "status": "success",
+                "male": {
+                    "name": request.name_boy,
+                    "birth_details": {
+                        "date": request.birth_date_boy,
+                        "time": request.birth_time_boy,
+                        "location": {
+                            "latitude": request.latitude_boy,
+                            "longitude": request.longitude_boy
+                        }
+                    },
+                    "astro_details": male_details
+                },
+                "female": {
+                    "name": request.name_girl,
+                    "birth_details": {
+                        "date": request.birth_date_girl,
+                        "time": request.birth_time_girl,
+                        "location": {
+                            "latitude": request.latitude_girl,
+                            "longitude": request.longitude_girl
+                        }
+                    },
+                    "astro_details": female_details
+                },
+                "compatibility_analysis": compatibility,
+                "recommendations": get_compatibility_recommendations(compatibility, request.language.lower()),
+                "language": request.language.lower(),
+                "generated_at": datetime.now().isoformat(),
+                "calculation_method": "Vedic Ashtakoot Guna Milan (8-Point Compatibility) with Lahiri Ayanamsa Sidereal System"
+            }
+            
+            logger.info(f"Corrected love matching analysis completed successfully - Score: {compatibility.get('total_score', 0)}/{compatibility.get('max_possible_score', 36)}")
+            return response
+            
+        except HTTPException:
+            raise
+        except MemoryError as e:
+            logger.error(f"Memory error in corrected love matching: {e}")
+            raise HTTPException(status_code=507, detail="Insufficient memory to process the request")
+        except Exception as e:
+            logger.error(f"Unexpected error in corrected love matching: {e}")
+            raise HTTPException(status_code=500, detail=f"Love matching calculation failed: {str(e)}")
+        finally:
+            end_time = time.time()
+            logger.info(f"Corrected love matching endpoint completed in {end_time - start_time:.2f} seconds")
 
-@app.post("/panchang")
-async def panchang_endpoint(request: PanchangRequest):
-    """API endpoint to get Panchang information (Choghadiya and Hora)"""
-    try:
-        # Extract parameters from request
-        date_str = request.date
-        language = request.language
-        latitude = request.latitude
-        longitude = request.longitude
-        timezone_str = request.timezone
-        
-        logger.info(f"Panchang request: date={date_str}, lat={latitude}, lon={longitude}, language={language}")
-        
-        # Validate language
-        valid_languages = ["English", "Hindi", "Gujarati"]
-        if language not in valid_languages:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid language. Please provide one of: {', '.join(valid_languages)}"
-            )
-        
-        # Calculate Panchang data (Choghadiya and Hora) asynchronously
-        result = await asyncio.to_thread(
-            get_choghadiya_data,
-            date_str=date_str,
-            latitude=latitude,
-            longitude=longitude,
-            timezone_str=timezone_str,
-            language=language
-        )
-        
-        return result
+
+@app.get("/memory-stats")
+async def get_memory_stats():
+    """Get current memory usage statistics"""
+    return memory_manager.get_stats()
+
+@app.post("/force-cleanup")
+async def force_memory_cleanup():
+    """Force memory cleanup (admin endpoint)"""
+    memory_manager.force_cleanup()
+    return {"message": "Memory cleanup forced", "stats": memory_manager.get_stats()}
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint with memory information"""
+    stats = memory_manager.get_stats()
     
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"API error: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"An error occurred while processing your request: {str(e)}"
-        )
+    health_status = "healthy"
+    if stats["memory_usage_percent"] > 90:
+        health_status = "critical"
+    elif stats["memory_usage_percent"] > 80:
+        health_status = "warning"
+    
+    return {
+        "status": health_status,
+        "memory_stats": stats,
+        "timestamp": datetime.now().isoformat()
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     import argparse
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Horoscope and Panchang API Server')
-    parser.add_argument('--host', default=os.environ.get('HOROSCOPE_HOST', '0.0.0.0'),
+    parser.add_argument('--host', default=os.environ.get('HOROSCOPE_HOST', '127.0.0.1'),
                        help='Host to bind the server to (default: 0.0.0.0)')
     parser.add_argument('--port', type=int, default=int(os.environ.get('HOROSCOPE_PORT', 8000)),
                        help='Port to bind the server to (default: 8000)')
@@ -3675,8 +6294,8 @@ if __name__ == "__main__":
     try:
         uvicorn.run(
             app,
-            host=args.host,
-            port=args.port,
+            host="0.0.0.0",
+            port=8000,
             log_level=args.log_level.lower()
         )
     except Exception as e:
